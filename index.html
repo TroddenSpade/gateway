@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Marshall CODE · Gateway Web</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Oswald:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ============ TOP BAR ============ -->
+<header class="topbar">
+  <button class="icon-btn nav-toggle" id="navToggle" aria-label="Toggle navigation">☰</button>
+  <a class="brand" href="#" aria-label="Marshall CODE Gateway">
+    <span class="brand-script">Marshall</span>
+    <span class="brand-sub">CODE&nbsp;·&nbsp;GATEWAY&nbsp;WEB</span>
+  </a>
+
+  <div class="conn">
+    <span class="led" id="led" title="MIDI output status"></span>
+    <span class="conn-text" id="status">Not connected</span>
+    <span class="pill" id="sysexPill" title="SysEx support">SysEx: ?</span>
+  </div>
+
+  <div class="topbar-actions">
+    <button class="btn ghost" id="btnTuner" title="Open tuner">Tuner</button>
+    <button class="btn ghost" id="btnCloudSync" title="Refresh cloud session">Cloud</button>
+    <button class="btn primary" id="btnConnect">Connect</button>
+  </div>
+</header>
+
+<!-- ============ SHELL ============ -->
+<div class="shell">
+  <!-- SIDEBAR -->
+  <nav class="sidebar" id="sidebar" aria-label="Sections">
+    <button class="nav-item active" data-view="amp"><span class="ni">🎛</span>Amplifier</button>
+    <button class="nav-item" data-view="presets"><span class="ni">▦</span>Presets<span class="badge" id="presetBadge">0</span></button>
+    <button class="nav-item" data-view="cloud"><span class="ni">☁</span>Cloud</button>
+    <button class="nav-item" data-view="tuner"><span class="ni">♪</span>Tuner</button>
+    <button class="nav-item" data-view="monitor"><span class="ni">▤</span>MIDI Monitor</button>
+    <button class="nav-item" data-view="settings"><span class="ni">⚙</span>Settings</button>
+    <div class="sidebar-foot">
+      <div class="mini-status">
+        <div><label>Output</label><select id="out" aria-label="MIDI output"></select></div>
+        <div><label>Input</label><select id="inp" aria-label="MIDI input"></select></div>
+        <div><label>Channel</label><select id="ch" aria-label="MIDI channel"></select></div>
+        <button class="btn ghost sm" id="refresh">Rescan devices</button>
+      </div>
+    </div>
+  </nav>
+
+  <!-- MAIN -->
+  <main class="main" id="main">
+
+    <!-- ---------- AMPLIFIER ---------- -->
+    <section class="view active" id="view-amp">
+      <div class="view-head">
+        <div>
+          <h1>Amplifier</h1>
+          <p class="muted">Real-time control of your CODE 25 over Web MIDI. Every change is sent live.</p>
+        </div>
+        <div class="head-actions">
+          <button class="btn ghost" id="ampRecall">Read amp state</button>
+          <button class="btn ghost" id="ampSaveAmp" title="Store the current editor state into the amp's current slot">Store to amp</button>
+        </div>
+      </div>
+
+      <!-- Preset strip -->
+      <div class="card preset-strip">
+        <button class="arrow" id="pPrev" aria-label="Previous preset">‹</button>
+        <div class="lcd">
+          <div class="lcd-num" id="pNum">1</div>
+          <input class="lcd-name" id="pName" maxlength="18" value="PRESET 01" aria-label="Preset name" spellcheck="false">
+        </div>
+        <button class="arrow" id="pNext" aria-label="Next preset">›</button>
+        <div class="preset-strip-actions">
+          <button class="btn ghost sm" id="pRename">Rename</button>
+          <button class="btn ghost sm" id="pSaveLocal">Save to library</button>
+          <button class="btn primary sm" id="pStoreAmp">Store → amp slot</button>
+        </div>
+        <div class="strip-meta">
+          <span class="muted">Editing local slot <b id="pSlotLabel">1</b></span>
+        </div>
+      </div>
+
+      <!-- Tone & master controls (single section: panel knobs then Master on the right) -->
+      <div class="card">
+        <div class="card-title">Tone &amp; master controls
+          <span class="tag">stored in preset</span>
+          <span class="tag warn">Master · amp-only</span>
+        </div>
+        <div class="knob-row big" id="panelKnobs"></div>
+      </div>
+
+      <!-- Signal chain -->
+      <div class="section-head">
+        <h2>Signal chain</h2>
+        <p class="muted small">Tap a module header to collapse it. Drag a knob vertically, or scroll over it.</p>
+      </div>
+      <div class="chain" id="chain"></div>
+    </section>
+
+    <!-- ---------- PRESETS ---------- -->
+    <section class="view" id="view-presets">
+      <div class="view-head">
+        <div>
+          <h1>Preset library</h1>
+          <p class="muted">100 user slots. Select a slot to load it into the editor, then send it to the amp.</p>
+        </div>
+        <div class="head-actions">
+          <input class="input" id="presetSearch" placeholder="Filter presets…" aria-label="Filter presets">
+          <select class="input" id="presetFilter" aria-label="Filter">
+            <option value="all">All</option>
+            <option value="fav">Favourites</option>
+            <option value="named">Named</option>
+            <option value="empty">Unnamed</option>
+          </select>
+          <button class="btn ghost" id="btnSeedFactory">Seed factory names</button>
+          <button class="btn ghost" id="btnExportPresets">Export all</button>
+          <button class="btn ghost" id="btnImportPresets">Import</button>
+          <input type="file" id="filePresets" accept=".json" hidden>
+        </div>
+      </div>
+      <div class="preset-meta" id="presetMeta"></div>
+      <div class="preset-layout">
+        <div class="preset-grid" id="presetGrid"></div>
+        <aside class="card preset-detail" id="presetDetail"></aside>
+      </div>
+    </section>
+
+    <!-- ---------- CLOUD ---------- -->
+    <section class="view" id="view-cloud">
+      <div class="view-head">
+        <div>
+          <h1>Marshall Cloud</h1>
+          <p class="muted">Browse official &amp; community presets from codepresets.marshall.com, open them in the editor, and save favourites.</p>
+        </div>
+        <div class="head-actions">
+          <span class="pill" id="cloudStatus">offline</span>
+          <button class="btn ghost" id="btnCloudLogin">Sign in</button>
+        </div>
+      </div>
+
+      <div class="cloud-toolbar card">
+        <div class="subtabs" id="cloudTabs">
+          <button class="subtab active" data-type="Official">Official</button>
+          <button class="subtab" data-type="Community">Community</button>
+          <button class="subtab" data-type="My">My Library</button>
+          <button class="subtab" data-type="Fav">★ Favourites</button>
+        </div>
+        <div class="cloud-controls">
+          <div class="search">
+            <span>⌕</span>
+            <input id="cloudSearch" placeholder="Search song or artist…" aria-label="Search presets">
+            <button id="cloudClear" class="icon-btn" title="Clear">✕</button>
+          </div>
+          <select class="input" id="cloudSort" aria-label="Sort">
+            <option value="Newest">Newest</option>
+            <option value="Oldest">Oldest</option>
+            <option value="AToZ">A–Z</option>
+            <option value="ZToA">Z–A</option>
+            <option value="Downloads">Downloads</option>
+            <option value="Popular">Popularity</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="cloud-intro" id="cloudIntro"></div>
+      <div class="cloud-grid" id="cloudGrid"></div>
+      <div class="cloud-footer" id="cloudFooter">
+        <button class="btn ghost" id="cloudMore" hidden>Load more</button>
+        <span class="muted" id="cloudEnd"></span>
+      </div>
+    </section>
+
+    <!-- ---------- TUNER ---------- -->
+    <section class="view" id="view-tuner">
+      <div class="view-head"><div><h1>Tuner</h1><p class="muted">Play a string. The CODE outputs note data while in tuner mode.</p></div>
+        <div class="head-actions"><button class="btn primary" id="tunerToggle">Start tuner</button></div>
+      </div>
+      <div class="card tuner">
+        <div class="tuner-note" id="tunerNote">–</div>
+        <div class="tuner-needle"><div class="tuner-center"></div><div class="tuner-mark" id="tunerMark"></div></div>
+        <div class="tuner-flats" id="tunerHint">—</div>
+        <div class="muted small">Flat ◀ ▮ ▶ Sharp</div>
+      </div>
+    </section>
+
+    <!-- ---------- MONITOR ---------- -->
+    <section class="view" id="view-monitor">
+      <div class="view-head"><div><h1>MIDI Monitor</h1><p class="muted">Every byte in and out, decoded. Filter, pause, and clear as needed.</p></div>
+        <div class="head-actions">
+          <span class="muted small" id="monStats">no traffic yet</span>
+          <div class="seg seg-compact" id="monFormat">
+            <button type="button" data-fmt="hex" class="on">Hex</button>
+            <button type="button" data-fmt="text">Decoded</button>
+          </div>
+          <button class="btn ghost" id="monPause">Pause</button>
+          <button class="btn ghost" id="monClear">Clear</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="search monitor-search"><span>⌕</span><input id="monFilter" placeholder="Filter messages (cc, note, sysex, error…)"></div>
+        <div id="log" class="log" role="log" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <!-- ---------- SETTINGS ---------- -->
+    <section class="view" id="view-settings">
+      <div class="view-head"><div><h1>Settings</h1><p class="muted">Connection, mapping, data and about.</p></div></div>
+
+      <div class="card">
+        <div class="card-title">MIDI</div>
+        <div class="settings-grid">
+          <div><label>Output device</label><select id="out2"></select></div>
+          <div><label>Input device</label><select id="inp2"></select></div>
+          <div><label>MIDI channel</label><select id="ch2"></select></div>
+          <div><label class="chk"><input type="checkbox" id="optSysex" checked> Request SysEx access</label></div>
+          <div><label class="chk"><input type="checkbox" id="optThru"> Echo incoming CC back to amp (thru)</label></div>
+          <div><button class="btn" id="btnRescan2">Rescan</button></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Control-change map <span class="tag">advanced</span></div>
+        <p class="muted small">Official CODE MIDI chart v2.1 values. Edit only if you know your firmware differs.</p>
+        <div class="ccmap" id="ccMap"></div>
+        <div class="row-actions"><button class="btn ghost" id="btnResetCC">Reset to chart defaults</button></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Data</div>
+        <div class="row-actions wrap">
+          <button class="btn ghost" id="btnExportAll">Export library + settings</button>
+          <button class="btn ghost" id="btnImportAll">Import JSON</button>
+          <button class="btn ghost" id="btnClearAll">Clear all local data</button>
+          <input type="file" id="fileAll" accept=".json" hidden>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">About</div>
+        <p class="muted small">A full-featured web companion for the Marshall CODE series, built from the official CODE MIDI Implementation Chart v2.1. Live control, SysEx preset transfer, local library, and Marshall Cloud browsing.</p>
+        <p class="muted small">Not affiliated with Marshall Amplification. Use at your own risk.</p>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- mobile bottom nav -->
+<nav class="bottomnav" id="bottomnav">
+  <button data-view="amp">🎛<span>Amp</span></button>
+  <button data-view="presets">▦<span>Presets</span></button>
+  <button data-view="cloud">☁<span>Cloud</span></button>
+  <button data-view="tuner">♪<span>Tuner</span></button>
+  <button data-view="monitor">▤<span>MIDI</span></button>
+</nav>
+
+<!-- ============ CLOUD PRESET MODAL ============ -->
+<div class="modal" id="modalPreset" aria-hidden="true">
+  <div class="modal-card wide">
+    <button class="modal-x" data-close>✕</button>
+    <div id="modalPresetBody" class="modal-body"></div>
+  </div>
+</div>
+
+<!-- ============ LOGIN MODAL ============ -->
+<div class="modal" id="modalLogin" aria-hidden="true">
+  <div class="modal-card">
+    <button class="modal-x" data-close>✕</button>
+    <h2>Sign in to Marshall</h2>
+    <p class="muted small">Authenticates through the Marshall identity server via the local proxy. Your password is sent to Marshall, never stored.</p>
+    <div class="field"><label>Email</label><input class="input" id="loginEmail" type="email" autocomplete="username"></div>
+    <div class="field"><label>Password</label><input class="input" id="loginPass" type="password" autocomplete="current-password"></div>
+    <div class="field"><label class="chk"><input type="checkbox" id="loginRemember"> Remember email on this device</label></div>
+    <div class="row-actions"><button class="btn primary" id="loginGo">Sign in</button><button class="btn ghost" data-close>Cancel</button></div>
+    <div class="login-msg" id="loginMsg"></div>
+  </div>
+</div>
+
+<!-- ============ RENAME MODAL ============ -->
+<div class="modal" id="modalRename" aria-hidden="true">
+  <div class="modal-card">
+    <button class="modal-x" data-close>✕</button>
+    <h2>Rename preset</h2>
+    <div class="field"><label>Name (max 18)</label><input class="input" id="renameInput" maxlength="18"></div>
+    <div class="row-actions"><button class="btn primary" id="renameGo">Apply</button><button class="btn ghost" data-close>Cancel</button></div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script src="data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
