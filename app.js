@@ -8,6 +8,8 @@ const $  = s => document.querySelector(s);
 const $$ = s => Array.from(document.querySelectorAll(s));
 const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
 const hex = a => Array.from(a).map(b => b.toString(16).padStart(2,"0")).join(" ");
+/* Preset slots are 0-based (00–99), matching the amp / MIDI program numbers. */
+const pnum = n => String(n).padStart(2,"0");
 
 const store = {
   get(k,d){ try{ const v=localStorage.getItem(k); return v==null?d:JSON.parse(v); }catch(e){ return this._m?.[k] ?? d; } },
@@ -31,15 +33,17 @@ const state = {
   editSlot: 0,             // index into presets being edited
   edit: null,              // working preset (engine units)
   favs: store.get(LS.favs, {}), // cloud preset id -> name
-  cloud: { type:"Official", page:1, search:"", sort:"Newest", items:[], loading:false, hasMore:true, online:false },
+  cloud: { type:"Official", page:1, search:"", sort:"Newest", items:[], loading:false, hasMore:true, online:false, reqId:0 },
   login: { ok:false, email: store.get(LS.email,""), user:null },
-  master: 80
+  master: 80,
+  pendingName: null,       // { slot, name } while renaming a slot on the amp
+  pendingNameTimer: null
 };
 
 /* ---------------- preset model ---------------- */
 function blankPreset(slot){
   return {
-    name: DEFAULT_PRESET_NAME(slot+1),
+    name: DEFAULT_PRESET_NAME(slot),
     panel: { gain:50, bass:50, middle:50, treble:50, volume:50 },
     chain: {
       prefx:{ on:false, type:0, p1:50, p2:50, p3:50, p4:50 },
@@ -59,18 +63,28 @@ function loadPresets(){
     p = Array.from({length:NUM_PRESETS}, (_,i)=>blankPreset(i));
     store.set(LS.presets, p);
   }
-  // backfill any missing fields
-  p.forEach((preset,i)=>{ const b=blankPreset(i);
+  // Backfill missing fields and never trust stored data to be well-formed.
+  p = p.map((preset,i)=>{
+    const b = blankPreset(i);
+    if (!preset || typeof preset !== "object") return b;
+    preset.name = (typeof preset.name === "string" && preset.name.trim()) ? preset.name : b.name;
+    // Legacy libraries may hold either 0-based ("PRESET 00"…"PRESET 99") or
+    // 1-based ("PRESET 01"…"PRESET 100") placeholders. Normalise them to the
+    // 0-based names so slot N reads "PRESET NN".
+    if (/^PRESET \d+$/.test(preset.name)) preset.name = b.name;
     preset.panel = Object.assign({}, b.panel, preset.panel||{});
     preset.chain = preset.chain||{};
     Object.keys(b.chain).forEach(k=> preset.chain[k]=Object.assign({}, b.chain[k], preset.chain[k]||{}));
+    return preset;
   });
   state.presets = p;
+  store.set(LS.presets, p);
 }
 function savePresets(){ store.set(LS.presets, state.presets); }
 
 /* ---------------- MIDI ---------------- */
 let access = null, out = null, inp = null;
+let ampReadTimer = null;
 const MIDI_REALTIME = 0xF8;
 
 /* MIDI monitor buffer + view prefs */
@@ -102,7 +116,7 @@ function describeBytes(bytes){
     const name = rev[d[1]] || ("CC "+d[1]);
     return "Control change · " + name + " = " + d[2] + " (ch " + ch + ")";
   }
-  if (high===0xC0) return "Program change · preset " + (d[1]+1) + " (ch " + ch + ")";
+  if (high===0xC0) return "Program change · preset " + pnum(d[1]) + " (ch " + ch + ")";
   if (high===0x90) return "Note on · " + d[1] + " vel " + d[2];
   if (high===0x80) return "Note off · " + d[1];
   return hex(bytes);
@@ -169,9 +183,11 @@ function sendDelayTime(ms){
 }
 
 /* ---------------- SysEx preset encode/decode ----------------
-   62-byte payload per CODE MIDI chart v2.1, data bytes [0..61]. */
+   64-byte payload (data bytes [0..63]). The chart documents 62 bytes and calls
+   [58..61] fixed 0x01..0x04, but shipping firmware and every working editor send
+   two more bytes plus a fixed 0x0C,0x0D,0x1A,0x1B,0x1C,0x1D tail, so we mirror them. */
 function encodePreset(preset){
-  const d = new Uint8Array(62);
+  const d = new Uint8Array(64);
   const put = (i,v)=> d[i] = clamp(v|0, 0, 127);
   const name = (preset.name||"").slice(0,18).toUpperCase();
   for (let i=0;i<18;i++) d[i] = name.charCodeAt(i)||0x20;
@@ -189,14 +205,17 @@ function encodePreset(preset){
   put(46, c.rev.on?1:0);   put(47, c.rev.type);   put(48,c.rev.p1); put(49,c.rev.p2); put(50,c.rev.p3); put(51,c.rev.p4);
   put(52, c.power.on?1:0); put(53, c.power.type); put(54, c.cab.on?1:0); put(55, c.cab.type);
   put(56, c.power.resonance); put(57, c.power.presence);
-  put(58, 1); put(59, 2); put(60, 3); put(61, 4);
+  // Reserved tail. Prefer the bytes the amp returned (kept in sysexTail) so a
+  // name-only rewrite can't disturb them; otherwise the editors' fixed values.
+  const tail = (preset.sysexTail && preset.sysexTail.length >= 6) ? preset.sysexTail : [12,13,26,27,28,29];
+  put(58, tail[0]); put(59, tail[1]); put(60, tail[2]); put(61, tail[3]); put(62, tail[4]); put(63, tail[5]);
   return d;
 }
 function decodePreset(d, slot){
   const get = i => d[i]|0;
   let name = ""; for(let i=0;i<18;i++){ const ch=get(i); if(ch) name += String.fromCharCode(ch); }
   const p = blankPreset(slot);
-  p.name = name.trim() || DEFAULT_PRESET_NAME(slot+1);
+  p.name = name.trim() || DEFAULT_PRESET_NAME(slot);
   p.panel = { gain:get(19), bass:get(20), middle:get(21), treble:get(22), volume:get(23) };
   p.chain = {
     prefx:{ on:!!get(24), type:get(25), p1:get(26), p2:get(27), p3:get(28), p4:get(29) },
@@ -207,14 +226,79 @@ function decodePreset(d, slot){
     power:{ on:!!get(52), type:get(53), presence:get(57), resonance:get(56) },
     cab:  { on:!!get(54), type:get(55) }
   };
+  if (d.length >= 64) p.sysexTail = Array.from(d.slice(58,64));
   return p;
 }
 
 /* SysEx commands */
 function sysexSetCurrent(preset){ sysex([SYSEX.accessCurrent, SYSEX.set, 0x00, ...encodePreset(preset)]); }
-function sysexSetPreset(slot, preset){ sysex([SYSEX.accessPreset, SYSEX.set, slot & 0x7F, ...encodePreset(preset)]); }
+/* Store a preset to its numbered slot. CODE expects the 64-byte data followed by
+   a program change to the same slot — that's how the editor apps commit the write. */
+function sysexSetPreset(slot, preset){
+  sysex([SYSEX.accessPreset, SYSEX.set, slot & 0x7F, ...encodePreset(preset)]);
+  sendPC(slot);
+}
 function sysexRecallCurrent(){ sysex([SYSEX.accessCurrent, SYSEX.recall, 0x00]); }
 function sysexRecallPreset(slot){ sysex([SYSEX.accessPreset, SYSEX.recall, slot & 0x7F]); }
+
+/* "Read amp state" — ask the amp for its current settings and reflect the reply.
+   Gives clear feedback instead of silently doing nothing when no reply arrives. */
+function clearAmpReadPending(){
+  if (ampReadTimer){ clearTimeout(ampReadTimer); ampReadTimer = null; }
+  const b = document.querySelector("#ampRecall");
+  if (b){ b.disabled = false; b.textContent = "Read amp state"; }
+}
+function readAmpState(){
+  if (!out){ toast("Select a MIDI output first", "err"); return; }
+  if (!state.settings.sysex){ toast("Enable SysEx access in Settings, then reload", "err"); return; }
+  clearAmpReadPending();
+  sysexRecallCurrent();
+  const b = document.querySelector("#ampRecall");
+  if (b){ b.disabled = true; b.textContent = "Reading…"; }
+  ampReadTimer = setTimeout(()=>{
+    clearAmpReadPending();
+    toast("No reply from the amp — check the MIDI output/input and that SysEx is on.", "err");
+  }, 2500);
+  toast("Requested current settings from amp");
+}
+
+/* Renaming on the amp.
+   The MIDI chart has no "name only" command — a preset write always carries all
+   62 data bytes.  To avoid clobbering the amp's tone with the app's local copy we
+   ask the amp for that slot first (Recall Preset), swap the new name into the
+   returned data, then write the slot back.  Tone stays untouched, name persists. */
+function clearNameSync(){
+  if (state.pendingNameTimer){ clearTimeout(state.pendingNameTimer); state.pendingNameTimer = null; }
+  state.pendingName = null;
+}
+function syncNameToAmp(slot, name){
+  if (!out || !state.settings.sysex) return false;
+  clearNameSync();
+  state.pendingName = { slot: slot|0, name: String(name||"").toUpperCase().slice(0,18) };
+  sysexRecallPreset(slot);
+  logLine("out", `asking amp for preset ${pnum(slot)} to rename it`);
+  state.pendingNameTimer = setTimeout(()=>{
+    if (state.pendingName && state.pendingName.slot === (slot|0)){
+      clearNameSync();
+      toast("Amp didn't answer — the rename is saved in the app only.", "err");
+    }
+  }, 3000);
+  return true;
+}
+/* Apply a queued rename to the 62-byte payload the amp returned for a slot.
+   Keeps the amp's tone, swaps in the new name, writes the slot back. */
+function applyNameSync(slot, payload){
+  if (!state.pendingName || state.pendingName.slot !== (slot|0)) return false;
+  const nm = state.pendingName.name || "";
+  clearNameSync();
+  for (let i=0;i<18;i++) payload[i] = nm.charCodeAt(i) || 0x20;
+  sysexSetPreset(slot, decodePreset(payload, slot));
+  if (state.presets[slot]){ state.presets[slot].name = nm; savePresets(); }
+  if (slot === state.editSlot){
+    state.edit.name = nm; $("#pName").value = nm; renderPresetGrid();
+  }
+  return true;
+}
 
 function onSysEx(data){
   if (data[0]!==0xF0) return;
@@ -222,16 +306,29 @@ function onSysEx(data){
   if (!(data[1]===0x00 && data[2]===0x21 && data[3]===0x15)) return;
   const loc = data[7], cmd = data[8], num = data[9];
   if (cmd === SYSEX.returned){
-    const payload = data.slice(10, 72);
-    if (payload.length < 62) return;
-    const label = loc===SYSEX.accessPreset ? "preset "+((num|0)+1) : "current settings";
+    const payload = data.slice(10, Math.max(10, data.length-1));
+    if (payload.length < 58) return;
+    const isPreset = loc===SYSEX.accessPreset;
+    const slot = isPreset ? (num|0) : state.editSlot;
+    // Reply to our own rename recall: keep the amp's tone, apply the new name,
+    // then write the slot straight back so it persists across preset changes.
+    if (isPreset && applyNameSync(slot, payload)){
+      logLine("in", `preset ${pnum(slot)} returned — writing the new name back`);
+      clearAmpReadPending();
+      toast("Renamed & saved to amp slot "+pnum(slot), "ok");
+      return;
+    }
+    const label = isPreset ? "preset "+pnum(num|0) : "current settings";
     logLine("in", `SysEx data returned (${label})`);
-    const p = decodePreset(payload, loc===SYSEX.accessPreset ? num : state.editSlot);
-    // reflect into editor
-    if (loc===SYSEX.accessPreset){ state.presets[num] = p; savePresets(); }
-    else { state.master = state.master; }
-    loadIntoEditor(p);
-    toast("Received "+label+" from amp", "ok");
+    clearAmpReadPending();
+    const p = decodePreset(payload, slot);
+    if (isPreset){
+      state.presets[slot] = p; savePresets();
+      setPresetNumber(slot+1, false);
+    } else {
+      loadIntoEditor(p);
+    }
+    toast("Read "+label+" from amp", "ok");
   }
 }
 
@@ -249,7 +346,11 @@ function handleIncomingCC(cc, val){
   // find any control mapped to this CC and reflect it
   const rev = {}; Object.entries(state.cc).forEach(([k,v])=> rev[v]=k);
   const key = rev[cc]; if(!key) return;
-  if (["gain","bass","middle","treble","volume"].includes(key)){
+  if (key === "master"){
+    state.master = val;
+    const el = document.querySelector(".master-ctl .val"); if (el) el.textContent = val;
+    knobRefs.master?.redraw();
+  } else if (["gain","bass","middle","treble","volume"].includes(key)){
     state.edit.panel[key] = val; refreshPanelUI();
   } else if (key.endsWith("_on")){
     const sec = key.replace("_on",""); state.edit.chain[sec].on = !!val; refreshChainUI();
@@ -376,7 +477,7 @@ function buildPanel(){
     valEl.textContent = state.edit.panel[p.key];
     knobRefs["panel_"+p.key] = k;
   });
-  // master (global, not stored) — last in the row, pushed to the right when there's space
+  // master (global, not stored) — last in the row, just after the tone controls
   const ctl = document.createElement("div"); ctl.className="ctl master-ctl";
   ctl.innerHTML = `<div class="knob big"><i></i></div><div class="lbl">Master <span class="tag warn" style="font-size:9px">exp.</span></div><div class="val">0</div>`;
   wrap.appendChild(ctl);
@@ -552,8 +653,8 @@ function refreshPanelUI(){
 /* ---------------- editor ---------------- */
 function loadIntoEditor(preset){
   state.edit = JSON.parse(JSON.stringify(preset));
-  $("#pNum").textContent = state.editSlot+1;
-  $("#pSlotLabel").textContent = state.editSlot+1;
+  $("#pNum").textContent = pnum(state.editSlot);
+  $("#pSlotLabel").textContent = pnum(state.editSlot);
   $("#pName").value = state.edit.name;
   refreshPanelUI();
   refreshChainUI();
@@ -572,11 +673,11 @@ function loadIntoEditorQuiet(preset){
 function setPresetNumber(n, sendIt){
   n = ((n-1)%NUM_PRESETS+NUM_PRESETS)%NUM_PRESETS + 1;
   state.editSlot = n-1;
-  $("#pNum").textContent = n;
-  $("#pSlotLabel").textContent = n;
+  $("#pNum").textContent = pnum(n-1);
+  $("#pSlotLabel").textContent = pnum(n-1);
   if (sendIt) sendPC(n-1);
   loadIntoEditor(state.presets[state.editSlot]);
-  if (sendIt) toast("Preset "+n+": "+state.presets[n-1].name);
+  if (sendIt) toast("Preset "+pnum(n-1)+": "+state.presets[n-1].name);
 }
 
 /* ---------------- local preset grid ---------------- */
@@ -606,8 +707,9 @@ function renderPresetGrid(){
     const cell = document.createElement("div");
     cell.className = "pcell" + (i===state.editSlot?" cur":"") + (named?"":" unnamed");
     cell.dataset.slot = i;
+    cell.title = "Click to load · double-click to rename";
     cell.innerHTML = `<div class="pcell-top">
-        <span class="pn">${String(i+1).padStart(2,"0")}</span>
+        <span class="pn">${pnum(i)}</span>
         <span class="fav ${p.fav?"on":""}" data-fav title="Favourite">${p.fav?"★":"☆"}</span>
       </div>
       <div class="pnm">${escapeHtml(p.name)}</div>
@@ -615,6 +717,10 @@ function renderPresetGrid(){
     cell.addEventListener("click", e=>{
       if (e.target.closest("[data-fav]")){ p.fav=!p.fav; savePresets(); renderPresetGrid(); return; }
       setPresetNumber(i+1, false);
+    });
+    cell.addEventListener("dblclick", e=>{
+      if (e.target.closest("[data-fav]")) return;
+      openRename();
     });
     grid.appendChild(cell);
   });
@@ -647,8 +753,8 @@ function renderPresetDetail(){
   const onCount = ["prefx","amp","mod","delay","rev","power","cab"].filter(k=>c[k].on).length;
   box.innerHTML = `
     <div class="detail-head">
-      <h3>${String(state.editSlot+1).padStart(2,"0")} · ${escapeHtml(p.name)}</h3>
-      <span class="muted small">Slot ${state.editSlot+1} of 100 · ${onCount} modules on</span>
+      <h3>${pnum(state.editSlot)} · ${escapeHtml(p.name)}</h3>
+      <span class="muted small">Slot ${pnum(state.editSlot)} · ${onCount} modules on</span>
     </div>
     <div class="detail-devices">
       ${grp("Panel", "Gain · Bass · Middle · Treble · Volume", true, [["Gain",p.panel.gain],["Bass",p.panel.bass],["Mid",p.panel.middle],["Treb",p.panel.treble],["Vol",p.panel.volume]])}
@@ -662,11 +768,13 @@ function renderPresetDetail(){
     </div>
     <div class="row-actions wrap" style="margin-top:16px">
       <button class="btn primary sm" id="dtSend">Send to amp</button>
+      <button class="btn ghost sm" id="dtRename">Rename</button>
       <button class="btn ghost sm" id="dtCopy">Copy</button>
       <button class="btn ghost sm" id="dtPaste">Paste</button>
       <button class="btn ghost sm" id="dtClear">Clear</button>
     </div>`;
-  box.querySelector("#dtSend").onclick = ()=>{ sysexSetPreset(state.editSlot, state.presets[state.editSlot]); sendPC(state.editSlot); toast("Sent preset "+(state.editSlot+1)+" to amp","ok"); };
+  box.querySelector("#dtSend").onclick = ()=>{ sysexSetPreset(state.editSlot, state.presets[state.editSlot]); toast("Sent preset "+pnum(state.editSlot)+" to amp","ok"); };
+  box.querySelector("#dtRename").onclick = openRename;
   box.querySelector("#dtCopy").onclick = ()=>{ window._clip = JSON.parse(JSON.stringify(state.presets[state.editSlot])); toast("Copied"); };
   box.querySelector("#dtPaste").onclick = ()=>{ if(!window._clip) return toast("Clipboard empty","err"); state.presets[state.editSlot]=Object.assign(JSON.parse(JSON.stringify(window._clip)),{name:state.presets[state.editSlot].name}); savePresets(); loadIntoEditor(state.presets[state.editSlot]); toast("Pasted"); };
   box.querySelector("#dtClear").onclick = ()=>{ if(confirm("Reset this slot to default?")){ state.presets[state.editSlot]=blankPreset(state.editSlot); savePresets(); loadIntoEditor(state.presets[state.editSlot]); } };
@@ -680,10 +788,25 @@ async function cloudFetch(path, opts){
 }
 function setCloudStatus(){
   const el = $("#cloudStatus"); if(!el) return;
-  el.textContent = state.cloud.online ? (state.login.ok ? "online · signed in" : "online") : "offline";
+  const u = state.login.user;
+  const who = u && (u.name || u.email);
+  el.textContent = state.cloud.online
+    ? (state.login.ok ? "online · " + (who || "signed in") : "online")
+    : "offline";
+  if (el) el.title = who || "";
   el.classList.toggle("ok", state.cloud.online);
   el.classList.toggle("bad", !state.cloud.online);
   const b = $("#btnCloudLogin"); if(b) b.textContent = state.login.ok ? "Sign out" : "Sign in";
+}
+async function cloudProfile(){
+  try{
+    const j = await (await cloudFetch("/api/profile")).json();
+    if (j.ok){
+      state.login.user = Object.assign({}, state.login.user||{},
+        { name: j.name||"", email: j.email || (state.login.user&&state.login.user.email) || "" });
+      if (j.email) state.login.email = j.email;
+    }
+  }catch(_){ /* profile details are optional */ }
 }
 async function cloudCheck(){
   try{
@@ -691,21 +814,32 @@ async function cloudCheck(){
     const j = await r.json();
     state.cloud.online = true; state.login.ok = !!j.signedIn; state.login.user = j.user||null;
   }catch(e){ state.cloud.online = false; }
+  if (state.login.ok && !(state.login.user && state.login.user.name)) await cloudProfile();
   setCloudStatus();
 }
 async function cloudLoad(reset){
   const C = state.cloud;
   const introEl = $("#cloudIntro"); if(introEl) introEl.textContent = CLOUD_INTROS[C.type]||"";
-  if (C.loading) return;
-  if (reset){ C.page=1; C.items=[]; C.hasMore=true; }
-  if (C.type==="Fav"){ renderCloudFavs(); return; }
-  if (!C.hasMore) return;
+  // Any new load supersedes one still in flight, so the latest click always wins.
+  const reqId = ++C.reqId;
   C.loading = true;
+  if (reset){ C.page=1; C.items=[]; C.hasMore=true; }
+  if (C.type==="Fav"){ C.loading=false; renderCloudFavs(); return; }
+  if (C.type==="My" && !state.login.ok){
+    C.loading=false; C.hasMore=false;
+    $("#cloudMore").hidden = true; $("#cloudEnd").textContent = "";
+    $("#cloudGrid").innerHTML = `<div class="card" style="grid-column:1/-1">
+      <b>Sign in to see My Library.</b>
+      <p class="muted small">My Library lists the presets saved to your Marshall account. Use the <b>Sign in</b> button above — the local helper authenticates through Marshall's identity server for you, and your password is never stored. Presets you star on this device appear under <b>★ Favourites</b>.</p></div>`;
+    return;
+  }
+  if (!C.hasMore){ C.loading=false; return; }
   if (reset) $("#cloudGrid").innerHTML = Array.from({length:8},()=>`<div class="ccard skeleton" style="height:290px"></div>`).join("");
   $("#cloudMore").disabled = true;
   try{
     const url = `/Presets/GetPresets?page=${C.page}&type=${encodeURIComponent(C.type)}&searchTerm=${encodeURIComponent(C.search)}&sortOrder=${encodeURIComponent(C.sort)}`;
     const html = await (await cloudFetch(url)).text();
+    if (reqId !== C.reqId) return;         // superseded by a newer load
     const items = parsePresetList(html);
     C.online = true;
     if (!items.length){ C.hasMore=false; if(reset) $("#cloudGrid").innerHTML=`<p class="muted">No presets found.</p>`; }
@@ -713,19 +847,22 @@ async function cloudLoad(reset){
       C.items = reset ? items : C.items.concat(items);
       renderCloudGrid();
       C.page++;
-      if (items.length < 24) C.hasMore = false;
+      if (items.length < CLOUD_PAGE_SIZE) C.hasMore = false;
     }
   }catch(e){
+    if (reqId !== C.reqId) return;
     state.cloud.online=false;
     if (reset) $("#cloudGrid").innerHTML = `<div class="card" style="grid-column:1/-1">
       <b>Cloud unavailable.</b><p class="muted small">The browser cannot reach codepresets.marshall.com directly (CORS) and the local proxy is not running.</p>
       <p class="muted small">Start it with: <code>python3 proxy/server.py</code> then open the app at <code>http://localhost:8787</code>.</p></div>`;
     logLine("err","cloud: "+e.message);
   }finally{
-    C.loading=false; setCloudStatus();
-    $("#cloudMore").disabled=false;
-    $("#cloudMore").hidden = !C.hasMore || C.type==="Fav";
-    $("#cloudEnd").textContent = C.hasMore ? "" : "End of results";
+    if (reqId === C.reqId){
+      C.loading=false; setCloudStatus();
+      $("#cloudMore").disabled=false;
+      $("#cloudMore").hidden = !C.hasMore || C.type==="Fav";
+      $("#cloudEnd").textContent = C.hasMore ? "" : "End of results";
+    }
   }
 }
 function parsePresetList(html){
@@ -742,14 +879,15 @@ function renderCloudGrid(){
   const grid = $("#cloudGrid");
   grid.innerHTML = state.cloud.items.map(it=>{
     const fav = !!state.favs[it.id];
+    const cover = it.img
+      ? `<img class="ccard-img" loading="lazy" src="${it.img}" alt="${escapeHtml(it.name)}" onerror="this.style.opacity=.25">`
+      : `<div class="ccard-img empty" title="Cover loading…">♪</div>`;
     return `<div class="ccard" data-id="${it.id}">
-      <div class="ccard-img-wrap">
-        <img class="ccard-img" loading="lazy" src="${it.img}" alt="${escapeHtml(it.name)}" onerror="this.style.opacity=.25">
-      </div>
+      <div class="ccard-img-wrap">${cover}</div>
       <div class="ccard-body">
         <div style="display:flex;gap:8px;align-items:flex-start">
           <div class="ccard-title" style="flex:1">${escapeHtml(it.name)}</div>
-          <span class="fav ${fav?"on":""}" data-clfav="${it.id}" title="Favourite">${fav?"★":"☆"}</span>
+          <span class="fav ${fav?"on":""}" data-clfav="${it.id}" title="${fav?"Remove favourite":"Add favourite"}">${fav?"★":"☆"}</span>
         </div>
         <div class="ccard-meta">
           <span>⭳ ${it.downloads||0}</span><span class="${it.ratings?'on':''}">♨ ${it.ratings||0}</span>
@@ -758,30 +896,65 @@ function renderCloudGrid(){
   }).join("");
   grid.onclick = e=>{
     const favBtn = e.target.closest("[data-clfav]");
-    if (favBtn){ const id=favBtn.dataset.clfav; toggleFav(id, favBtn.closest(".ccard").querySelector(".ccard-title").textContent); renderCloudGrid(); return; }
+    if (favBtn){
+      const id = favBtn.dataset.clfav;
+      const it = state.cloud.items.find(x=>String(x.id)===String(id)) || state.favs[id] || {};
+      toggleFav(id, it);
+      (state.cloud.type==="Fav" ? renderCloudFavs : renderCloudGrid)();
+      return;
+    }
     const card = e.target.closest(".ccard"); if(card) openCloudPreset(card.dataset.id);
   };
 }
-function toggleFav(id, name){
+function toggleFav(id, item){
   if (state.favs[id]){ delete state.favs[id]; toast("Removed favourite"); }
-  else { state.favs[id]={name}; toast("Added to favourites ★"); }
+  else {
+    const it = (item && typeof item==="object") ? item : { name: item };
+    state.favs[id] = {
+      name: String(it.name || ("Preset "+id)).slice(0,60),
+      img: it.img || "",
+      downloads: it.downloads || "",
+      ratings: it.ratings || ""
+    };
+    toast("Added to favourites ★");
+  }
   store.set(LS.favs, state.favs);
 }
 function renderCloudFavs(){
   const ids = Object.keys(state.favs);
   const grid = $("#cloudGrid");
   $("#cloudMore").hidden = true; $("#cloudEnd").textContent = "";
-  if (!ids.length){ grid.innerHTML = `<p class="muted">No favourites yet. Star presets in Official or Community.</p>`; return; }
-  state.cloud.items = ids.map(id=>({ id, name: state.favs[id].name||("Preset "+id), img:"", downloads:"", ratings:"" }));
-  grid.innerHTML = state.cloud.items.map(it=>`<div class="ccard" data-id="${it.id}">
-      <div class="ccard-body" style="padding:22px"><div class="ccard-title">${escapeHtml(it.name)}</div>
-      <div class="ccard-meta"><span>id ${it.id}</span></div></div>
-      <span class="fav on" data-clfav="${it.id}" style="top:10px;right:10px;position:absolute">★</span></div>`).join("");
-  grid.onclick = e=>{
-    const favBtn = e.target.closest("[data-clfav]");
-    if (favBtn){ toggleFav(favBtn.dataset.clfav, state.favs[favBtn.dataset.clfav]?.name||""); renderCloudFavs(); return; }
-    const card = e.target.closest(".ccard"); if(card) openCloudPreset(card.dataset.id);
-  };
+  if (!ids.length){ grid.innerHTML = `<p class="muted">No favourites yet. Star presets in Official, Community or My Library.</p>`; return; }
+  state.cloud.items = ids.map(id=>{
+    const f = state.favs[id] || {};
+    return { id, name: f.name || ("Preset "+id), img: f.img || "", downloads: f.downloads || "", ratings: f.ratings || "" };
+  });
+  renderCloudGrid();                       // identical look to the other tabs
+  fillFavImages(ids.filter(id=>!(state.favs[id] && state.favs[id].img)));
+}
+/* Older favourites were stored as {name} only — backfill their cover art. */
+async function fillFavImages(ids){
+  if (!ids.length) return;
+  let changed = false;
+  for (const id of ids){
+    if (!state.favs[id] || state.favs[id].img) continue;
+    try{
+      const html = await (await cloudFetch(`/Presets/GetPresetModalHeader?presetId=${id}`)).text();
+      const doc = new DOMParser().parseFromString(html,"text/html");
+      const img = fixImg(doc.querySelector(".preset-modal-image img")?.getAttribute("src")||"");
+      const name = (doc.querySelector("#PresetName")?.textContent||"").trim();
+      const f = state.favs[id]; if (!f) continue;
+      if (img){ f.img = img; changed = true; }
+      if (name) f.name = name;
+      const card = document.querySelector('#cloudGrid .ccard[data-id="'+id+'"]');
+      if (card){
+        const wrap = card.querySelector(".ccard-img-wrap");
+        if (wrap && f.img) wrap.innerHTML = `<img class="ccard-img" loading="lazy" src="${f.img}" alt="${escapeHtml(f.name)}" onerror="this.style.opacity=.25">`;
+        const t = card.querySelector(".ccard-title"); if (t && name) t.textContent = name;
+      }
+    }catch(_){ /* leave the placeholder if offline */ }
+  }
+  if (changed) store.set(LS.favs, state.favs);
 }
 async function openCloudPreset(id){
   const body = $("#modalPresetBody");
@@ -828,8 +1001,8 @@ async function openCloudPreset(id){
         ${d.params.map(p=>`<div class="dp"><b>${p.display}${p.max===10?"":" / "+p.max}</b>${escapeHtml(p.name)}</div>`).join("") || '<span class="muted small">No parameters</span>'}
       </div>`).join("");
     $("#cdLoad").onclick = ()=>{ local.name = name; loadIntoEditorQuiet(local); closeModal("#modalPreset"); switchView("amp"); toast("Loaded into editor — tweak then Store to amp","ok"); };
-    $("#cdSlot").onclick = ()=>{ const i = state.presets.findIndex(p=>/^PRESET \d+$/.test(p.name)); const slot=i<0?state.editSlot:i; state.presets[slot]=Object.assign(local,{name}); savePresets(); renderPresetGrid(); toast("Saved to slot "+(slot+1),"ok"); };
-    $("#cdFav").onclick = ()=>{ toggleFav(id, name); $("#cdFav").textContent = state.favs[id]?"★ Favourited":"☆ Favourite"; renderCloudGrid(); };
+    $("#cdSlot").onclick = ()=>{ const i = state.presets.findIndex(p=>/^PRESET \d+$/.test(p.name)); const slot=i<0?state.editSlot:i; state.presets[slot]=Object.assign(local,{name}); savePresets(); renderPresetGrid(); toast("Saved to slot "+pnum(slot),"ok"); };
+    $("#cdFav").onclick = ()=>{ toggleFav(id, { name, img, downloads:"", ratings:"" }); $("#cdFav").textContent = state.favs[id]?"★ Favourited":"☆ Favourite"; (state.cloud.type==="Fav"?renderCloudFavs:renderCloudGrid)(); };
     $("#cdLib").onclick = async ()=>{
       try{ const r = await cloudFetch("/Presets/MyLibraryDownload", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({presetId:id}) });
         const j = await r.json(); toast(j.downloaded?"Added to Marshall library":"Removed from library","ok");
@@ -912,7 +1085,7 @@ async function doLogin(){
     state.login.ok = !!j.ok; state.login.user = { email };
     if ($("#loginRemember").checked){ store.set(LS.email, email); state.login.email=email; }
     $("#loginMsg").innerHTML = j.ok ? '<span style="color:var(--ok)">Signed in.</span>' : `<span style="color:var(--red)">${escapeHtml(j.error||"Sign-in failed")}</span>`;
-    if (j.ok){ setCloudStatus(); setTimeout(()=>closeModal("#modalLogin"),700); if(state.cloud.type==="My") cloudLoad(true); }
+    if (j.ok){ setCloudStatus(); cloudProfile().then(setCloudStatus); setTimeout(()=>closeModal("#modalLogin"),700); if(state.cloud.type==="My") cloudLoad(true); }
   }catch(e){
     $("#loginMsg").innerHTML = `<span style="color:var(--red)">Cloud proxy not reachable. Run <code>python3 proxy/server.py</code> and open via http://localhost:8787.</span>`;
   }
@@ -964,6 +1137,13 @@ function viewFromHash(){ const h=(location.hash||"").replace(/^#/,""); return h|
 /* ---------------- modals ---------------- */
 function openModal(sel){ $(sel).classList.add("open"); $(sel).setAttribute("aria-hidden","false"); }
 function closeModal(sel){ $(sel).classList.remove("open"); $(sel).setAttribute("aria-hidden","true"); }
+/* Open the rename dialog for the preset currently in the editor. */
+function openRename(){
+  const inp = $("#renameInput"); if (!inp) return;
+  inp.value = state.edit ? state.edit.name : "";
+  openModal("#modalRename");
+  setTimeout(()=>{ inp.focus(); inp.select(); }, 40);
+}
 document.addEventListener("click", e=>{
   if (e.target.matches("[data-close]") || e.target.classList.contains("modal")){
     const m = e.target.closest(".modal"); if(m){ m.classList.remove("open"); m.setAttribute("aria-hidden","true"); }
@@ -979,7 +1159,7 @@ function buildCCMap(){
     delay_on:"Delay on",delay_type:"Delay type",delay_msb:"Delay MSB",delay_lsb:"Delay LSB",delay_p2:"Delay P2",delay_p3:"Delay P3",delay_p4:"Delay P4",
     rev_on:"Reverb on",rev_type:"Reverb type",rev_p1:"Rev P1",rev_p2:"Rev P2",rev_p3:"Rev P3",rev_p4:"Rev P4",
     power_on:"Power on",power_type:"Power type",cab_on:"Cab on",cab_type:"Cab type",presence:"Presence",resonance:"Resonance",master:"Master (exp.)" };
-  Object.keys(DEFAULT_CC).concat("master").forEach(k=>{
+  Object.keys(DEFAULT_CC).forEach(k=>{
     const row = document.createElement("div"); row.className="row";
     row.innerHTML = `<span>${labels[k]||k}</span><input inputmode="numeric" value="${state.cc[k]??""}" data-k="${k}">`;
     box.appendChild(row);
@@ -1021,19 +1201,35 @@ function wire(){
   // preset strip (editSlot is 0-based; setPresetNumber takes 1-based n and wraps)
   $("#pPrev").onclick = ()=>setPresetNumber(state.editSlot, true);     // current-1
   $("#pNext").onclick = ()=>setPresetNumber(state.editSlot+2, true);   // current+1
-  $("#pName").onchange = ()=>{ state.edit.name = $("#pName").value.toUpperCase().slice(0,18); commitEditorToSlot(); renderPresetGrid(); };
-  $("#pRename").onclick = ()=>{ $("#renameInput").value = state.edit.name; openModal("#modalRename"); };
-  $("#pSaveLocal").onclick = ()=>{ commitEditorToSlot(); renderPresetGrid(); toast("Saved to slot "+(state.editSlot+1),"ok"); };
-  $("#pStoreAmp").onclick = ()=>{ commitEditorToSlot(); sysexSetPreset(state.editSlot, state.presets[state.editSlot]); toast("Stored to amp slot "+(state.editSlot+1),"ok"); };
-  $("#ampRecall").onclick = ()=>{ sysexRecallCurrent(); toast("Requested current settings from amp"); };
+  $("#pName").onchange = ()=>{
+    let v = ($("#pName").value||"").trim().toUpperCase().slice(0,18) || DEFAULT_PRESET_NAME(state.editSlot);
+    $("#pName").value = v;
+    if (v === state.edit.name) return;
+    const slot = state.editSlot;
+    state.edit.name = v; commitEditorToSlot(); renderPresetGrid();
+    if (syncNameToAmp(slot, v)) toast("Renamed to "+v+" — updating the amp…","ok");
+  };
+  $("#pRename").onclick = openRename;
+  $("#pSaveLocal").onclick = ()=>{ commitEditorToSlot(); renderPresetGrid(); toast("Saved to slot "+pnum(state.editSlot),"ok"); };
+  $("#pStoreAmp").onclick = ()=>{ commitEditorToSlot(); sysexSetPreset(state.editSlot, state.presets[state.editSlot]); toast("Stored to amp slot "+pnum(state.editSlot),"ok"); };
+  $("#ampRecall").onclick = readAmpState;
   $("#ampSaveAmp").onclick = ()=>{ sysexSetCurrent(state.edit); toast("Sent current settings to amp"); };
 
-  $("#renameGo").onclick = ()=>{ state.edit.name = $("#renameInput").value.toUpperCase().slice(0,18); commitEditorToSlot(); $("#pName").value=state.edit.name; renderPresetGrid(); closeModal("#modalRename"); };
+  $("#renameGo").onclick = ()=>{
+    const v = ($("#renameInput").value||"").trim().toUpperCase().slice(0,18);
+    if (!v) return toast("Name cannot be empty","err");
+    const slot = state.editSlot;
+    state.edit.name = v; commitEditorToSlot();
+    $("#pName").value = v; renderPresetGrid();
+    closeModal("#modalRename");
+    if (syncNameToAmp(slot, v)) toast("Renamed to "+v+" — updating the amp…","ok");
+    else toast("Renamed to "+v,"ok");
+  };
 
   // presets view
   $("#presetSearch").oninput = renderPresetGrid;
   $("#presetFilter").onchange = renderPresetGrid;
-  $("#btnSeedFactory").onclick = seedFactoryNames;
+  $("#btnSeedFactory").onclick = ()=>seedFactoryNames();
   $("#btnExportPresets").onclick = ()=>download("code25-presets.json", state.presets);
   $("#btnImportPresets").onclick = ()=>$("#filePresets").click();
   $("#filePresets").onchange = async ()=>{ try{ const arr=JSON.parse(await readFile($("#filePresets"))); if(Array.isArray(arr)){ for(let i=0;i<NUM_PRESETS;i++) state.presets[i]=Object.assign(blankPreset(i), arr[i]||{}); savePresets(); renderPresetGrid(); loadIntoEditor(state.presets[state.editSlot]); toast("Imported ","ok"); } }catch(e){ toast("Import failed","err"); } };
@@ -1072,19 +1268,36 @@ function wire(){
 
 function debounce(fn,ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a),ms); }; }
 
-async function seedFactoryNames(){
-  toast("Fetching factory preset names from Marshall…");
+async function seedFactoryNames({silent=false}={}){
+  if (!silent) toast("Fetching factory preset names from Marshall…");
   const names=[];
   try{
-    for (let page=1; page<=5 && names.length<100; page++){
+    for (let page=1; page<=12 && names.length<NUM_PRESETS; page++){
       const html = await (await cloudFetch(`/Presets/GetPresets?page=${page}&type=Official&searchTerm=&sortOrder=Oldest`)).text();
       const items = parsePresetList(html);
       if (!items.length) break;
-      items.forEach(i=>names.push(i.name));
+      items.forEach(i=>{ if (i.name) names.push(i.name); });
     }
-  }catch(e){ toast("Cloud unavailable — start the proxy","err"); return; }
-  names.slice(0,100).forEach((nm,i)=>{ if (nm && /^PRESET \d+$/.test(state.presets[i].name)) state.presets[i].name = nm.toUpperCase().slice(0,18); });
-  savePresets(); renderPresetGrid(); toast("Seeded "+(names.length)+" names","ok");
+  }catch(e){ if(!silent) toast("Cloud unavailable — start the proxy","err"); return 0; }
+  if (!names.length){ if(!silent) toast("No factory names returned","err"); return 0; }
+  let seeded = 0;
+  names.slice(0,NUM_PRESETS).forEach((nm,i)=>{
+    if (nm && /^PRESET \d+$/.test(state.presets[i].name)){
+      state.presets[i].name = nm.toUpperCase().slice(0,18); seeded++;
+    }
+  });
+  store.set(LS.seed, true);
+  savePresets(); renderPresetGrid();
+  if (!silent) toast("Seeded "+seeded+" names","ok");
+  return seeded;
+}
+
+/* Fill the library with real factory names the first time the proxy is online.
+   Runs once (tracked in storage) so manual renames are never overwritten later. */
+function maybeSeedFactoryNames(){
+  if (store.get(LS.seed, false)) return;
+  if (!state.cloud.online) return;
+  seedFactoryNames({silent:true});
 }
 
 /* cloud intro is set inside cloudLoad() */
@@ -1101,7 +1314,7 @@ function boot(){
   wire();
   loadIntoEditor(state.presets[0]);
   initMIDI();
-  cloudCheck();
+  cloudCheck().then(maybeSeedFactoryNames);
   const startView = viewFromHash();
   if (startView!=="amp") switchView(startView);
   window.addEventListener("hashchange", ()=>switchView(viewFromHash()));
@@ -1125,5 +1338,6 @@ window.GW = {
   setPresetNumber, switchView, loadIntoEditor, loadIntoEditorQuiet,
   cloudLoad, cloudCheck, cloudToLocal, parsePresetDetail, parsePresetList,
   toggleFav, blankPreset, handleIncomingCC, openCloudPreset, openModal, closeModal,
+  openRename, renderCloudFavs, syncNameToAmp, applyNameSync,
   logLine, renderMonitor, describeBytes, hexToBytes, monBuf, monCount
 };

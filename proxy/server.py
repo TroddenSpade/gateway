@@ -19,17 +19,27 @@ import json
 import os
 import re
 import sys
+import html as htmlmod
 import posixpath
 import mimetypes
 import threading
 import urllib.parse
 import urllib.request
 import urllib.error
-from http.cookiejar import MozillaCookieJar
+from http.cookiejar import MozillaCookieJar, Absent
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PORT = 8787
+
+# Redirected stdout/stderr on Windows can default to cp1252, which cannot
+# encode the box-drawing / arrow characters in the banner.  Force UTF-8 so
+# `python proxy/server.py > log.txt` never crashes at startup.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 
 def resolve_root():
@@ -58,18 +68,46 @@ BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
 # ---------------------------------------------------------------
 #  Shared upstream session (single-user local tool)
 # ---------------------------------------------------------------
+class SkewTolerantCookieJar(MozillaCookieJar):
+    """Cookie jar that tolerates clock skew between this machine and
+    Marshall's servers.
+
+    The OIDC flow sets a short-lived (15 minute) ``OpenIdConnect.nonce``
+    cookie. When the local clock runs ahead of the server's — which is easy
+    to hit — Python treats that cookie as already expired and silently drops
+    it, so the ``signin-oidc`` callback fails its nonce check and sign-in
+    never completes. We keep such (non-empty) cookies as session cookies
+    instead of discarding them, and still process genuine deletions (empty
+    values) normally.
+    """
+
+    def _cookie_from_cookie_tuple(self, tup, request):
+        name, value, standard, rest = tup
+        if value and standard.get("expires", Absent) is not Absent:
+            standard = dict(standard)
+            standard["expires"] = Absent      # treat as a session cookie
+        return super()._cookie_from_cookie_tuple((name, value, standard, rest), request)
+
+
 class Session:
     def __init__(self):
         self.lock = threading.Lock()
-        self.cookies = MozillaCookieJar()
+        self.cookies = SkewTolerantCookieJar()
         self.email = None
         self._opener = None
+        self.last_redirects = []
 
     def _build_opener(self):
         cp = urllib.request.HTTPCookieProcessor(self.cookies)
-        # Do not auto-follow redirects ourselves; let urllib do it, but we need
-        # the final URL, which urllib exposes via response.geturl().
-        self._opener = urllib.request.build_opener(cp)
+        session = self
+
+        class _RecordingRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                session.last_redirects.append(newurl)
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+        # Let urllib follow redirects and record them; we need the final URL.
+        self._opener = urllib.request.build_opener(cp, _RecordingRedirect())
 
     def request(self, method, url, data=None, headers=None, timeout=15):
         with self.lock:
@@ -98,15 +136,29 @@ class Session:
                     return e
                 except Exception as e:            # transient TLS/connection resets
                     last_err = e
-                    if method != "GET":
+                    if attempt == 2:
                         break
                     import time as _t
                     _t.sleep(0.25 * (attempt + 1))
             raise last_err
 
     def signed_in(self):
+        """True only when a cookie set by the presets site (not the shared
+        identity server) is present. The identity server sets its own
+        AspNetCore cookies even on a failed sign-in, which previously caused
+        false 'signed in' positives."""
         for c in self.cookies:
-            if "marshall.com" in (c.domain or "") and "AspNetCore" in c.name:
+            dom = (c.domain or "").lstrip(".").lower()
+            name = c.name or ""
+            if "idserver" in dom:
+                continue
+            # Ignore request-flow cookies that carry no authentication.
+            if any(x in name for x in ("Antiforgery", "Correlation", "Nonce", "nonce")):
+                continue
+            # The presets site issues its own ASP.NET auth cookie once the OIDC
+            # callback completes (".AspNet.Cookies"); older builds used the
+            # ".AspNetCore.Cookies" name. Either one means we are signed in.
+            if dom.endswith("marshall.com") and "AspNet" in name and "Cookies" in name:
                 return True
         return False
 
@@ -114,6 +166,7 @@ class Session:
         with self.lock:
             self.cookies.clear()
             self.email = None
+            self.last_redirects = []
 
 
 SESSION = Session()
@@ -127,14 +180,36 @@ def _hidden_value(html, name):
     for tag in tag_re.findall(html):
         if re.search(r'name\s*=\s*["\']' + re.escape(name) + r'["\']', tag, re.I):
             m = re.search(r'value\s*=\s*["\']([^"\']*)["\']', tag, re.I)
-            return m.group(1) if m else ""
+            return htmlmod.unescape(m.group(1)) if m else ""
     return None
+
+
+def _form_action(html):
+    """Return a form's action URL (HTML-unescaped), or None."""
+    m = re.search(r'<form\b[^>]*action\s*=\s*["\']([^"\']+)["\']', html, re.I)
+    return htmlmod.unescape(m.group(1)) if m else None
+
+
+def _all_hidden(html):
+    """Collect every hidden input as {name: value} (HTML-unescaped)."""
+    out = {}
+    for tag in re.findall(r"<input\b[^>]*>", html, re.I):
+        if not re.search(r'type\s*=\s*["\']hidden["\']', tag, re.I):
+            continue
+        nm = re.search(r'name\s*=\s*["\']([^"\']+)["\']', tag, re.I)
+        if not nm:
+            continue
+        vm = re.search(r'value\s*=\s*["\']([^"\']*)["\']', tag, re.I)
+        out[nm.group(1)] = htmlmod.unescape(vm.group(1)) if vm else ""
+    return out
 
 
 def do_login(email, password):
     """Best-effort OIDC form login. Returns (ok, message)."""
     if not email or not password:
         return False, "Email and password are required."
+
+    SESSION.last_redirects = []
 
     # 1. Kick off the flow: this lands on the idserver login page.
     resp = SESSION.request(
@@ -165,8 +240,11 @@ def do_login(email, password):
         "ReturnUrl": return_url or "",
         "ReferrerUrl": referrer,
         "__RequestVerificationToken": token,
-        # reCAPTCHA is rendered on the page; an empty token is sent when it is
-        # not solved. Some deployments accept it, others block — handled below.
+        # The login page's submit <button name="button" value="login"> is what
+        # tells the controller to run the password grant. Omitting it makes the
+        # identity server bounce back with OAuth error=access_denied even when
+        # the credentials are correct.
+        "button": "login",
         "g-recaptcha-response": "",
         "AcceptedTermsAndConditions": "false",
     }
@@ -183,21 +261,66 @@ def do_login(email, password):
         },
     )
     final_url = post.geturl()
-    body = post.read().decode("utf-8", "replace")
+    post_body = post.read().decode("utf-8", "replace")
+
+    # 2. On success the identity server answers with an auto-submitting
+    #    form_post to the client app (signin-oidc). Follow it so the client can
+    #    set its own auth cookie — otherwise the login never completes.
+    action = _form_action(post_body)
+    if action and "access_denied" not in post_body and 'name="Password"' not in post_body:
+        callback_url = urllib.parse.urljoin(final_url, action)
+        fields = _all_hidden(post_body)
+        cb = SESSION.request(
+            "POST",
+            callback_url,
+            data=fields,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "text/html",
+                "Referer": final_url,
+                "Origin": UPSTREAM,
+            },
+        )
+        post_body = cb.read().decode("utf-8", "replace")
+        final_url = cb.geturl()
 
     if SESSION.signed_in():
         SESSION.email = email
         return True, "ok"
 
     # Detect the usual failure modes.
-    if "recaptcha" in body.lower() and 'name="Password"' in body:
-        return False, ("Marshall's sign-in page is protected by reCAPTCHA, which the "
-                       "local helper cannot solve. Sign in to codepresets.marshall.com "
-                       "in your normal browser, then use Cloud browsing (Official / "
-                       "Community) which needs no account.")
-    if 'name="Password"' in body:
+    if 'name="Password"' in post_body:
         return False, "Sign-in rejected — check the email and password."
+    denied = ("access_denied" in post_body
+              or any("access_denied" in u for u in SESSION.last_redirects))
+    if denied:
+        return False, ("Marshall refused the sign-in (access_denied). Check the "
+                       "email and password; if they are correct the account may "
+                       "need attention at marshall.com.")
     return False, "Sign-in did not complete (final URL: %s)." % final_url
+
+
+def profile_info():
+    """Fetch /codeprofile and parse the signed-in user's name + email.
+
+    Returns {name, email} or None when the session is not authenticated."""
+    resp = SESSION.request(
+        "GET", UPSTREAM + "/codeprofile", headers={"Accept": "text/html"})
+    final = resp.geturl()
+    html = resp.read().decode("utf-8", "replace")
+    if "idserver.marshall.com" in final or 'name="Password"' in html:
+        return None
+
+    def field(label):
+        m = re.search(
+            r'<label[^>]*>\s*' + re.escape(label) + r'\s*</label>'
+            r'.*?<span[^>]*>(.*?)</span>',
+            html, re.I | re.S)
+        if not m:
+            return ""
+        return re.sub(r"<[^>]+>", "", m.group(1)).strip()
+
+    return {"name": field("FULL NAME"), "email": field("EMAIL")}
 
 
 # ---------------------------------------------------------------
@@ -262,16 +385,26 @@ class Handler(BaseHTTPRequestHandler):
             })
         if path == "/api/login" and method == "POST":
             return self._api_login()
+        if path == "/api/profile":
+            if not SESSION.signed_in():
+                return self._json({"ok": False, "error": "not signed in"}, 401)
+            try:
+                info = profile_info()
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)}, 502)
+            if not info:
+                return self._json({"ok": False, "error": "profile unavailable"}, 502)
+            return self._json({"ok": True, "name": info["name"], "email": info["email"]})
         if path == "/api/logout":
             SESSION.clear()
             return self._json({"ok": True})
         if path == "/api/ping":
             return self._json({"ok": True, "upstream": UPSTREAM})
 
-        # Upstream passthrough: API, images, auth callbacks.
+        # Upstream passthrough: API, images, auth callbacks, profile.
         if path.startswith(("/Presets/", "/Content/", "/account/",
                             "/signin-oidc", "/signout", "/Identity/",
-                            "/connect/", "/api/upstream")):
+                            "/connect/", "/codeprofile", "/api/upstream")):
             return self._proxy(method, parsed)
 
         return self._static(path)

@@ -63,8 +63,8 @@
           <p class="muted">Real-time control of your CODE 25 over Web MIDI. Every change is sent live.</p>
         </div>
         <div class="head-actions">
-          <button class="btn ghost" id="ampRecall">Read amp state</button>
-          <button class="btn ghost" id="ampSaveAmp" title="Store the current editor state into the amp's current slot">Store to amp</button>
+          <button class="btn ghost" id="ampRecall" title="Ask the amp to send its current settings back into the editor">Read amp state</button>
+          <button class="btn ghost" id="ampSaveAmp" title="Send the editor as the amp's live/current settings. This is not saved to a preset slot — use 'Store → amp slot' to keep it.">Send live to amp</button>
         </div>
       </div>
 
@@ -72,8 +72,8 @@
       <div class="card preset-strip">
         <button class="arrow" id="pPrev" aria-label="Previous preset">‹</button>
         <div class="lcd">
-          <div class="lcd-num" id="pNum">1</div>
-          <input class="lcd-name" id="pName" maxlength="18" value="PRESET 01" aria-label="Preset name" spellcheck="false">
+          <div class="lcd-num" id="pNum">00</div>
+          <input class="lcd-name" id="pName" maxlength="18" value="PRESET 00" aria-label="Preset name" spellcheck="false">
         </div>
         <button class="arrow" id="pNext" aria-label="Next preset">›</button>
         <div class="preset-strip-actions">
@@ -82,7 +82,7 @@
           <button class="btn primary sm" id="pStoreAmp">Store → amp slot</button>
         </div>
         <div class="strip-meta">
-          <span class="muted">Editing local slot <b id="pSlotLabel">1</b></span>
+          <span class="muted">Editing local slot <b id="pSlotLabel">00</b></span>
         </div>
       </div>
 
@@ -273,7 +273,7 @@
   <div class="modal-card">
     <button class="modal-x" data-close>✕</button>
     <h2>Sign in to Marshall</h2>
-    <p class="muted small">Authenticates through the Marshall identity server via the local proxy. Your password is sent to Marshall, never stored.</p>
+    <p class="muted small">Authenticates through the Marshall identity server via the local proxy. Your password is sent to Marshall, never stored. Once signed in you can load your saved <b>My Library</b> presets; Official / Community presets and device Favourites need no account.</p>
     <div class="field"><label>Email</label><input class="input" id="loginEmail" type="email" autocomplete="username"></div>
     <div class="field"><label>Password</label><input class="input" id="loginPass" type="password" autocomplete="current-password"></div>
     <div class="field"><label class="chk"><input type="checkbox" id="loginRemember"> Remember email on this device</label></div>

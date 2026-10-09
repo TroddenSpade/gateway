@@ -17,14 +17,23 @@ const DEFAULT_CC = {
   rev_on:108, rev_type:109, rev_p1:110, rev_p2:111, rev_p3:112, rev_p4:113,
   power_on:114, power_type:115,
   cab_on:116, cab_type:117,
-  presence:67, resonance:66
+  presence:67, resonance:66,
+  // Master volume: not printed on the CODE chart (the amp's master is global),
+  // but CC 7 is the standard MIDI Master/Channel Volume and is what most CODE
+  // firmware listens on. Editable in Settings if your firmware differs.
+  master:7
 };
 
-/* ---- SysEx framing ---- */
+/* ---- SysEx framing ----
+   The published CODE chart labels 0x72 as "Access Current Settings" and 0x73 as
+   "Access Preset", but shipping firmware (and every working editor — the Java
+   MarshallCodeAmpInterface, marshallcode.tools and the CodeEditor app) is the
+   other way round: 0x72 addresses a numbered preset slot, 0x73 the live/current
+   settings. We follow the hardware, not the chart's labels. */
 const SYSEX = {
   header:[0x00,0x21,0x15,0x7F,0x7F,0x7F], // MMA + Marshall global ID
-  accessCurrent:0x72,
-  accessPreset:0x73,
+  accessCurrent:0x73,
+  accessPreset:0x72,
   set:0x02,
   recall:0x01,
   returned:0x03
@@ -196,7 +205,8 @@ const LS = {
   settings:"code25.settings.v2",
   cc:"code25.cc.v2",
   favs:"code25.favs.v2",
-  email:"code25.email"
+  email:"code25.email",
+  seed:"code25.seeded.v1"
 };
 
 /* Cloud proxy base (see proxy/server.py).
@@ -204,6 +214,8 @@ const LS = {
    - Opened as a local file       -> talk to the proxy at :8787 (it allows CORS). */
 const CLOUD_BASE = (location.port === "8787") ? "" : "http://localhost:8787";
 function cloudUrl(path){ return CLOUD_BASE + path; }
+/* Marshall returns this many presets per GetPresets page. */
+const CLOUD_PAGE_SIZE = 12;
 function fixImg(src){
   if (!src) return "";
   if (/^https?:\/\//i.test(src) || src.startsWith("data:")) return src;
