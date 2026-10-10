@@ -17,11 +17,11 @@ const DEFAULT_CC = {
   rev_on:108, rev_type:109, rev_p1:110, rev_p2:111, rev_p3:112, rev_p4:113,
   power_on:114, power_type:115,
   cab_on:116, cab_type:117,
-  presence:67, resonance:66,
-  // Master volume: not printed on the CODE chart (the amp's master is global),
-  // but CC 7 is the standard MIDI Master/Channel Volume and is what most CODE
-  // firmware listens on. Editable in Settings if your firmware differs.
-  master:7
+  presence:67, resonance:66
+  // NOTE: The CODE has no Master-volume control over MIDI. Its Master is a
+  // physical analog output pot with no Control-Change or SysEx address (it is
+  // absent from chart v2.1's CC list and from the 72-byte SysEx payload), so it
+  // cannot be set over USB. The UI shows the knob disabled for parity only.
 };
 
 /* ---- SysEx framing ----

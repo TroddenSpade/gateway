@@ -20,9 +20,14 @@ const store = {
 function toast(msg, kind="") {
   const t = document.createElement("div");
   t.className = "toast " + kind;
-  t.textContent = msg;
+  const icon = kind==="ok" ? "✓" : kind==="err" ? "!" : "•";
+  t.innerHTML = `<span class="ti" aria-hidden="true"></span><span class="tm"></span><button class="tx" aria-label="Dismiss">✕</button>`;
+  t.querySelector(".ti").textContent = icon;
+  t.querySelector(".tm").textContent = msg;
+  const kill = ()=>{ if (!t.isConnected) return; t.style.opacity="0"; t.style.transition="opacity .3s"; setTimeout(()=>t.remove(),320); };
+  t.querySelector(".tx").onclick = kill;
   $("#toasts").appendChild(t);
-  setTimeout(()=>{ t.style.opacity="0"; t.style.transition="opacity .3s"; setTimeout(()=>t.remove(),320); }, 3400);
+  setTimeout(kill, 4200);
 }
 
 /* ---------------- state ---------------- */
@@ -35,7 +40,6 @@ const state = {
   favs: store.get(LS.favs, {}), // cloud preset id -> name
   cloud: { type:"Official", page:1, search:"", sort:"Newest", items:[], loading:false, hasMore:true, online:false, reqId:0 },
   login: { ok:false, email: store.get(LS.email,""), user:null },
-  master: 80,
   pendingName: null,       // { slot, name } while renaming a slot on the amp
   pendingNameTimer: null
 };
@@ -90,7 +94,7 @@ const MIDI_REALTIME = 0xF8;
 /* MIDI monitor buffer + view prefs */
 const monBuf = [];
 const monCount = { in:0, out:0, sys:0, err:0 };
-let monPaused = false, monHex = true;
+let monPaused = false, monHex = true, monDir = "all", monAuto = true;
 
 function logLine(dir, text){
   const l = $("#log"); if (!l) return;
@@ -98,8 +102,8 @@ function logLine(dir, text){
   monBuf.push(rec); if (monBuf.length > 600) monBuf.shift();
   monCount[dir] = (monCount[dir]||0) + 1;
   if (monPaused) { updateMonStats(); return; }
-  appendMonLine(l, rec);
-  l.scrollTop = l.scrollHeight;
+  if (monDir==="all" || monDir===dir) appendMonLine(l, rec);
+  if (monAuto) l.scrollTop = l.scrollHeight;
   updateMonStats();
 }
 function hexToBytes(text){
@@ -144,13 +148,14 @@ function renderMonitor(){
   const q = ($("#monFilter")?.value||"").toLowerCase();
   l.innerHTML = "";
   monBuf.forEach(rec=>{
+    if (monDir!=="all" && rec.dir!==monDir) return;
     if (q){
       const hay = (rec.text + " " + describeMaybe(rec.text) + " " + rec.dir).toLowerCase();
       if (!hay.includes(q)) return;
     }
     appendMonLine(l, rec);
   });
-  l.scrollTop = l.scrollHeight;
+  if (monAuto) l.scrollTop = l.scrollHeight;
   updateMonStats();
 }
 function updateMonStats(){
@@ -346,11 +351,7 @@ function handleIncomingCC(cc, val){
   // find any control mapped to this CC and reflect it
   const rev = {}; Object.entries(state.cc).forEach(([k,v])=> rev[v]=k);
   const key = rev[cc]; if(!key) return;
-  if (key === "master"){
-    state.master = val;
-    const el = document.querySelector(".master-ctl .val"); if (el) el.textContent = val;
-    knobRefs.master?.redraw();
-  } else if (["gain","bass","middle","treble","volume"].includes(key)){
+  if (["gain","bass","middle","treble","volume"].includes(key)){
     state.edit.panel[key] = val; refreshPanelUI();
   } else if (key.endsWith("_on")){
     const sec = key.replace("_on",""); state.edit.chain[sec].on = !!val; refreshChainUI();
@@ -448,7 +449,11 @@ function makeKnob(node, {min=0,max=100, get, set, big=false, onInput, step}={}){
   const i = node.querySelector("i");
   // Wide-range controls (e.g. delay time 0–4000 ms) get a finer pixels-per-value ratio.
   const pxPerRange = (max-min) > 400 ? 360 : 180;
-  const draw = v => { const p=(clamp(v,min,max)-min)/(max-min); i.style.transform=`rotate(${-135+p*270}deg)`; };
+  const draw = v => {
+    const p = (clamp(v,min,max)-min)/(max-min);
+    i.style.transform = `rotate(${-135+p*270}deg)`;
+    node.style.setProperty("--p", p.toFixed(4));   // drives the level ring in CSS
+  };
   draw(get());
   let dragging=false, y0=0, v0=0;
   node.tabIndex=0; node.setAttribute("role","slider");
@@ -460,6 +465,9 @@ function makeKnob(node, {min=0,max=100, get, set, big=false, onInput, step}={}){
   node.addEventListener("pointerup", e=>{ dragging=false; try{node.releasePointerCapture(e.pointerId);}catch(_){} });
   node.addEventListener("wheel", e=>{ e.preventDefault(); commit(get() + (e.deltaY<0?unit:-unit)); }, {passive:false});
   node.addEventListener("keydown", e=>{ const d={ArrowUp:1,ArrowRight:1,ArrowDown:-1,ArrowLeft:-1}[e.key]; if(d){ e.preventDefault(); commit(get()+d*(e.shiftKey?1:unit)); } });
+  // Double-click resets to the middle of the range (50 for 0–100 controls).
+  node.addEventListener("dblclick", e=>{ e.preventDefault(); commit(min + (max-min)/2); });
+  if (!node.title) node.title = "Drag vertically · scroll to fine-tune · double-click to reset";
   return { draw, redraw:()=>draw(get()) };
 }
 
@@ -477,13 +485,16 @@ function buildPanel(){
     valEl.textContent = state.edit.panel[p.key];
     knobRefs["panel_"+p.key] = k;
   });
-  // master (global, not stored) — last in the row, just after the tone controls
-  const ctl = document.createElement("div"); ctl.className="ctl master-ctl";
-  ctl.innerHTML = `<div class="knob big"><i></i></div><div class="lbl">Master <span class="tag warn" style="font-size:9px">exp.</span></div><div class="val">0</div>`;
+  // Master — shown for parity with the amp but disabled: the CODE's Master is a
+  // physical analog pot with no MIDI/SysEx address, so it cannot be remote-
+  // controlled. It sends nothing and receives nothing; loudness is set with the
+  // panel Volume knob (CC 74).
+  const ctl = document.createElement("div");
+  ctl.className = "ctl master-ctl disabled";
+  ctl.setAttribute("aria-disabled","true");
+  ctl.title = "The CODE's Master is a physical analog control — it has no MIDI or SysEx address and cannot be set over USB. Use Volume to change loudness from the app.";
+  ctl.innerHTML = `<div class="knob big"><i></i></div><div class="lbl">Master <span class="tag warn" style="font-size:9px">hw</span></div><div class="val">—</div>`;
   wrap.appendChild(ctl);
-  const node = ctl.querySelector(".knob"), valEl = ctl.querySelector(".val");
-  const k = makeKnob(node, { min:0, max:100, get:()=>state.master, set:v=>state.master=v, onInput:v=>{ valEl.textContent=v; sendCC("master", v); } });
-  valEl.textContent = state.master; knobRefs.master = k;
 }
 
 function buildChain(){
@@ -619,12 +630,26 @@ function renderParams(sec){
   if(!blk) return;
   const box = blk.querySelector("[data-params]");
   box.innerHTML="";
+  // Every chain box uses two centred rows: the Mode/selector row on top (when the
+  // model has one), then the knob row beneath it.
+  box.classList.add("stacked");
   const model = currentModel(sec);
   if (!model.params.length){
     box.innerHTML = `<div class="param-empty">Cabinet selection only — no adjustable parameters.</div>`;
     return;
   }
-  model.params.forEach(p=> box.appendChild(p.options ? createSegmented(sec,p) : createMiniKnob(sec,p)));
+  const segs  = model.params.filter(p => p.options);
+  const knobs = model.params.filter(p => !p.options);
+  if (segs.length){
+    const row = document.createElement("div"); row.className = "params-row mode-row";
+    segs.forEach(p => row.appendChild(createSegmented(sec,p)));
+    box.appendChild(row);
+  }
+  if (knobs.length){
+    const row = document.createElement("div"); row.className = "params-row row-knobs";
+    knobs.forEach(p => row.appendChild(createMiniKnob(sec,p)));
+    box.appendChild(row);
+  }
 }
 function refreshChainUI(){
   const c = state.edit.chain;
@@ -641,13 +666,16 @@ function refreshChainUI(){
     sw.classList.toggle("on", !!s.on);
     sw.setAttribute("aria-checked", s.on?"true":"false");
     const sel = blk.querySelector("[data-model]"); if (sel) sel.value = s.type;
+    const eb = blk.querySelector(".eyebrow");
+    if (eb){ const n = sec.models.length; const idx = clamp(s.type|0,0,n-1); eb.textContent = `Model ${idx+1} / ${n}`; }
     renderParams(sec);
   });
+  updateStripDirty();
 }
 function refreshPanelUI(){
   PANEL.forEach(p=>{ const k=knobRefs["panel_"+p.key]; if(k) k.redraw();
     const v=document.querySelector(`#panelKnobs .ctl:nth-child(${PANEL.indexOf(p)+1}) .val`); if(v) v.textContent=state.edit.panel[p.key]; });
-  knobRefs.master?.redraw();
+  updateStripDirty();
 }
 
 /* ---------------- editor ---------------- */
@@ -661,6 +689,13 @@ function loadIntoEditor(preset){
   renderPresetGrid();
 }
 function commitEditorToSlot(){ state.presets[state.editSlot] = JSON.parse(JSON.stringify(state.edit)); savePresets(); }
+/* True when the editor differs from the stored slot — drives the "unsaved" chip. */
+function editorDirty(){
+  if (!state.edit || !state.presets || !state.presets[state.editSlot]) return false;
+  try { return JSON.stringify(state.edit) !== JSON.stringify(state.presets[state.editSlot]); }
+  catch(_){ return false; }
+}
+function updateStripDirty(){ const d = $("#pDirty"); if (d) d.hidden = !editorDirty(); }
 
 /* Load a preset into the editor without touching the local-slot number or grid. */
 function loadIntoEditorQuiet(preset){
@@ -684,13 +719,10 @@ function setPresetNumber(n, sendIt){
 function renderPresetGrid(){
   const q = ($("#presetSearch")?.value||"").toLowerCase();
   const f = $("#presetFilter")?.value||"all";
+  const sort = $("#presetSort")?.value||"slot";
   const grid = $("#presetGrid"); if(!grid) return;
   grid.innerHTML="";
-  let namedCount = 0, favCount = 0, fxCount = 0;
-  state.presets.forEach((p,i)=>{
-    const named = p.name && !/^PRESET \d+$/.test(p.name);
-    if (named) namedCount++;
-    if (p.fav) favCount++;
+  const chipsFor = p => {
     const chips = [];
     if (p.chain.amp.on) chips.push("Amp");
     if (p.chain.prefx.on) chips.push("Pre");
@@ -699,11 +731,28 @@ function renderPresetGrid(){
     if (p.chain.rev.on) chips.push("Rev");
     if (p.chain.power.on) chips.push("Pow");
     if (p.chain.cab.on) chips.push("Cab");
-    if (chips.length > 1) fxCount++;
+    return chips;
+  };
+  // Counters always reflect the whole library, regardless of filter/sort.
+  let namedCount = 0, favCount = 0, fxCount = 0;
+  state.presets.forEach(p=>{
+    if (p.name && !/^PRESET \d+$/.test(p.name)) namedCount++;
+    if (p.fav) favCount++;
+    if (chipsFor(p).length > 1) fxCount++;
+  });
+  let order = state.presets.map((p,i)=>({p,i}));
+  if (sort==="az") order.sort((a,b)=>a.p.name.localeCompare(b.p.name) || a.i-b.i);
+  else if (sort==="za") order.sort((a,b)=>b.p.name.localeCompare(a.p.name) || a.i-b.i);
+  else if (sort==="fav") order.sort((a,b)=>(b.p.fav?1:0)-(a.p.fav?1:0) || a.i-b.i);
+  let shown = 0;
+  order.forEach(({p,i})=>{
+    const named = p.name && !/^PRESET \d+$/.test(p.name);
     if (q && !p.name.toLowerCase().includes(q)) return;
     if (f==="fav" && !p.fav) return;
     if (f==="named" && !named) return;
     if (f==="empty" && named) return;
+    shown++;
+    const chips = chipsFor(p);
     const cell = document.createElement("div");
     cell.className = "pcell" + (i===state.editSlot?" cur":"") + (named?"":" unnamed");
     cell.dataset.slot = i;
@@ -726,7 +775,7 @@ function renderPresetGrid(){
   });
   if (!grid.children.length) grid.innerHTML = `<p class="muted small" style="grid-column:1/-1">No presets match.</p>`;
   const meta = $("#presetMeta");
-  if (meta) meta.innerHTML = `<span class="stat"><b>${namedCount}</b> named</span><span class="stat"><b>${favCount}</b> favourite${favCount===1?"":"s"}</span><span class="stat"><b>${fxCount}</b> with effects</span>`;
+  if (meta) meta.innerHTML = `<span class="stat"><b>${shown}</b> shown</span><span class="stat"><b>${namedCount}</b> named</span><span class="stat"><b>${favCount}</b> favourite${favCount===1?"":"s"}</span><span class="stat"><b>${fxCount}</b> with effects</span>`;
   const badge = $("#presetBadge"); if (badge) badge.textContent = namedCount;
   renderPresetDetail();
 }
@@ -826,11 +875,12 @@ async function cloudLoad(reset){
   if (reset){ C.page=1; C.items=[]; C.hasMore=true; }
   if (C.type==="Fav"){ C.loading=false; renderCloudFavs(); return; }
   if (C.type==="My" && !state.login.ok){
-    C.loading=false; C.hasMore=false;
+    C.loading=false; C.hasMore=false; C.items=[];
     $("#cloudMore").hidden = true; $("#cloudEnd").textContent = "";
     $("#cloudGrid").innerHTML = `<div class="card" style="grid-column:1/-1">
       <b>Sign in to see My Library.</b>
       <p class="muted small">My Library lists the presets saved to your Marshall account. Use the <b>Sign in</b> button above — the local helper authenticates through Marshall's identity server for you, and your password is never stored. Presets you star on this device appear under <b>★ Favourites</b>.</p></div>`;
+    updateCloudCount();
     return;
   }
   if (!C.hasMore){ C.loading=false; return; }
@@ -862,6 +912,7 @@ async function cloudLoad(reset){
       $("#cloudMore").disabled=false;
       $("#cloudMore").hidden = !C.hasMore || C.type==="Fav";
       $("#cloudEnd").textContent = C.hasMore ? "" : "End of results";
+      updateCloudCount();
     }
   }
 }
@@ -875,6 +926,12 @@ function parsePresetList(html){
     ratings: (el.querySelector(".rating-count")?.textContent||"").trim()
   })).filter(x=>x.id);
 }
+function updateCloudCount(){
+  const el = $("#cloudCount"); if (!el) return;
+  const n = state.cloud.items.length;
+  if (state.cloud.type==="Fav") el.textContent = n ? `${n} favourite${n===1?"":"s"}` : "";
+  else el.textContent = n ? `${n} preset${n===1?"":"s"} shown` : "";
+}
 function renderCloudGrid(){
   const grid = $("#cloudGrid");
   grid.innerHTML = state.cloud.items.map(it=>{
@@ -883,7 +940,7 @@ function renderCloudGrid(){
       ? `<img class="ccard-img" loading="lazy" src="${it.img}" alt="${escapeHtml(it.name)}" onerror="this.style.opacity=.25">`
       : `<div class="ccard-img empty" title="Cover loading…">♪</div>`;
     return `<div class="ccard" data-id="${it.id}">
-      <div class="ccard-img-wrap">${cover}</div>
+      <div class="ccard-img-wrap">${cover}<span class="ccard-open">Open preset ▸</span></div>
       <div class="ccard-body">
         <div style="display:flex;gap:8px;align-items:flex-start">
           <div class="ccard-title" style="flex:1">${escapeHtml(it.name)}</div>
@@ -894,6 +951,7 @@ function renderCloudGrid(){
         </div>
       </div></div>`;
   }).join("");
+  updateCloudCount();
   grid.onclick = e=>{
     const favBtn = e.target.closest("[data-clfav]");
     if (favBtn){
@@ -924,7 +982,7 @@ function renderCloudFavs(){
   const ids = Object.keys(state.favs);
   const grid = $("#cloudGrid");
   $("#cloudMore").hidden = true; $("#cloudEnd").textContent = "";
-  if (!ids.length){ grid.innerHTML = `<p class="muted">No favourites yet. Star presets in Official, Community or My Library.</p>`; return; }
+  if (!ids.length){ state.cloud.items = []; grid.innerHTML = `<p class="muted">No favourites yet. Star presets in Official, Community or My Library.</p>`; updateCloudCount(); return; }
   state.cloud.items = ids.map(id=>{
     const f = state.favs[id] || {};
     return { id, name: f.name || ("Preset "+id), img: f.img || "", downloads: f.downloads || "", ratings: f.ratings || "" };
@@ -1097,24 +1155,39 @@ async function doLogout(){
 
 /* ---------------- TUNER ---------------- */
 let tunerOn = false;
+const tunerNotes = [];
+const NOTE_NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+function renderTunerHistory(){
+  const el = $("#tunerHistory"); if (!el) return;
+  el.innerHTML = tunerNotes.map((n,i)=>`<span class="tnote${i===0?" now":""}">${escapeHtml(n)}</span>`).join("");
+}
 function toggleTuner(){
   tunerOn = !tunerOn;
   $("#tunerToggle").textContent = tunerOn ? "Stop tuner" : "Start tuner";
+  const st = $("#tunerStatus");
+  if (st){ st.textContent = tunerOn ? "listening" : "idle"; st.classList.toggle("ok", tunerOn); st.classList.toggle("bad", false); }
   // Ask the amp to enter tuner mode via the documented button combo equivalent is not exposed over CC;
   // tuner notes are transmitted while the amp's tuner is engaged. We still request note data listening.
   if (tunerOn){ toast("Tuner listening — engage TUNER on the amp (PRE FX + AMP)."); switchView("tuner"); }
-  else { $("#tunerNote").textContent="–"; $("#tunerMark").style.left="50%"; $("#tunerHint").textContent="—"; }
+  else {
+    $("#tunerNote").textContent="–"; $("#tunerOctave").textContent=""; $("#tunerMark").style.left="50%"; $("#tunerHint").textContent="—";
+    tunerNotes.length = 0; renderTunerHistory();
+  }
 }
 function onTunerMIDI(data){
   if (!tunerOn) return false;
   const status = data[0];
   if ((status & 0xF0) === 0x90 && data[2] > 0){
-    const names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
     const n = data[1];
-    const note = names[n%12] + (Math.floor(n/12)-1);
+    const pc = n % 12, oct = Math.floor(n/12) - 1;
+    const note = NOTE_NAMES[pc];
     $("#tunerNote").textContent = note;
+    $("#tunerOctave").textContent = "octave " + oct;
     $("#tunerMark").style.left = "50%";
-    $("#tunerHint").textContent = "Detected "+note;
+    $("#tunerHint").textContent = "Detected " + note + oct;
+    tunerNotes.unshift(note + oct);
+    tunerNotes.length = Math.min(tunerNotes.length, 6);
+    renderTunerHistory();
     return true;
   }
   return false;
@@ -1149,27 +1222,78 @@ document.addEventListener("click", e=>{
     const m = e.target.closest(".modal"); if(m){ m.classList.remove("open"); m.setAttribute("aria-hidden","true"); }
   }
 });
+/* Global keyboard: Esc closes dialogs; number keys switch views; arrows step
+   presets while the Amplifier is showing. Skipped while typing or using a knob. */
+document.addEventListener("keydown", e=>{
+  if (e.key === "Escape"){
+    const open = document.querySelector(".modal.open");
+    if (open){ open.classList.remove("open"); open.setAttribute("aria-hidden","true"); }
+    return;
+  }
+  const ae = document.activeElement;
+  const typing = ae && (/^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName) || ae.isContentEditable || ae.getAttribute?.("role")==="slider");
+  if (typing) return;
+  if (document.querySelector(".modal.open")) return;
+  const views = { "1":"amp","2":"presets","3":"cloud","4":"tuner","5":"monitor","6":"settings" };
+  if (views[e.key]){ e.preventDefault(); switchView(views[e.key]); return; }
+  if ($("#view-amp")?.classList.contains("active")){
+    if (e.key==="ArrowLeft"){ e.preventDefault(); setPresetNumber(state.editSlot, true); }
+    else if (e.key==="ArrowRight"){ e.preventDefault(); setPresetNumber(state.editSlot+2, true); }
+  }
+});
 
 /* ---------------- settings UI ---------------- */
+const CC_LABELS = { gain:"Gain",bass:"Bass",middle:"Middle",treble:"Treble",volume:"Volume",
+  prefx_on:"Pre FX on",prefx_type:"Pre FX type",prefx_p1:"Pre FX P1",prefx_p2:"Pre FX P2",prefx_p3:"Pre FX P3",prefx_p4:"Pre FX P4",
+  amp_on:"Amp on",amp_type:"Amp type",gate:"Gate threshold",mod_on:"Mod on",mod_type:"Mod type",mod_p1:"Mod P1",mod_p2:"Mod P2",mod_p3:"Mod P3",mod_p4:"Mod P4",
+  delay_on:"Delay on",delay_type:"Delay type",delay_msb:"Delay MSB",delay_lsb:"Delay LSB",delay_p2:"Delay P2",delay_p3:"Delay P3",delay_p4:"Delay P4",
+  rev_on:"Reverb on",rev_type:"Reverb type",rev_p1:"Rev P1",rev_p2:"Rev P2",rev_p3:"Rev P3",rev_p4:"Rev P4",
+  power_on:"Power on",power_type:"Power type",cab_on:"Cab on",cab_type:"Cab type",presence:"Presence",resonance:"Resonance" };
+const CC_GROUPS = [
+  ["Panel tone", ["gain","bass","middle","treble","volume"]],
+  ["Pre FX", ["prefx_on","prefx_type","prefx_p1","prefx_p2","prefx_p3","prefx_p4"]],
+  ["Amplifier", ["amp_on","amp_type","gate"]],
+  ["Modulation", ["mod_on","mod_type","mod_p1","mod_p2","mod_p3","mod_p4"]],
+  ["Delay", ["delay_on","delay_type","delay_msb","delay_lsb","delay_p2","delay_p3","delay_p4"]],
+  ["Reverb", ["rev_on","rev_type","rev_p1","rev_p2","rev_p3","rev_p4"]],
+  ["Power & cabinet", ["power_on","power_type","presence","resonance","cab_on","cab_type"]],
+];
+function renderCCRows(){
+  const box = $("#ccMap"); if (!box) return;
+  const q = ($("#ccSearch")?.value||"").toLowerCase();
+  box.innerHTML = "";
+  CC_GROUPS.forEach(([title, keys])=>{
+    const vis = keys.filter(k => !q || (CC_LABELS[k]||k).toLowerCase().includes(q) || k.toLowerCase().includes(q));
+    if (!vis.length) return;
+    const grp = document.createElement("div"); grp.className = "ccmap-group";
+    const h = document.createElement("div"); h.className = "ccmap-group-title"; h.textContent = title; grp.appendChild(h);
+    const grid = document.createElement("div"); grid.className = "ccmap";
+    vis.forEach(k=>{
+      const changed = state.cc[k] !== DEFAULT_CC[k];
+      const row = document.createElement("div");
+      row.className = "row" + (changed ? " changed" : "");
+      row.innerHTML = `<span>${CC_LABELS[k]||k}</span><input inputmode="numeric" value="${state.cc[k]??""}" data-k="${k}" aria-label="${CC_LABELS[k]||k} CC number">`;
+      grid.appendChild(row);
+    });
+    grp.appendChild(grid);
+    box.appendChild(grp);
+  });
+  if (!box.children.length) box.innerHTML = `<p class="muted small">No controls match.</p>`;
+}
+function onCCChange(e){
+  const k = e.target?.dataset?.k; if (!k) return;
+  const v = e.target.value.trim();
+  if (v===""||isNaN(v)) state.cc[k]=""; else state.cc[k]=clamp(+v,0,127);
+  store.set(LS.cc, state.cc);
+  const row = e.target.closest(".row"); if (row) row.classList.toggle("changed", state.cc[k] !== DEFAULT_CC[k]);
+}
 function buildCCMap(){
-  const box = $("#ccMap"); box.innerHTML="";
-  const labels = { gain:"Gain",bass:"Bass",middle:"Middle",treble:"Treble",volume:"Volume",
-    prefx_on:"Pre FX on",prefx_type:"Pre FX type",prefx_p1:"Pre FX P1",prefx_p2:"Pre FX P2",prefx_p3:"Pre FX P3",prefx_p4:"Pre FX P4",
-    amp_on:"Amp on",amp_type:"Amp type",gate:"Gate threshold",mod_on:"Mod on",mod_type:"Mod type",mod_p1:"Mod P1",mod_p2:"Mod P2",mod_p3:"Mod P3",mod_p4:"Mod P4",
-    delay_on:"Delay on",delay_type:"Delay type",delay_msb:"Delay MSB",delay_lsb:"Delay LSB",delay_p2:"Delay P2",delay_p3:"Delay P3",delay_p4:"Delay P4",
-    rev_on:"Reverb on",rev_type:"Reverb type",rev_p1:"Rev P1",rev_p2:"Rev P2",rev_p3:"Rev P3",rev_p4:"Rev P4",
-    power_on:"Power on",power_type:"Power type",cab_on:"Cab on",cab_type:"Cab type",presence:"Presence",resonance:"Resonance",master:"Master (exp.)" };
-  Object.keys(DEFAULT_CC).forEach(k=>{
-    const row = document.createElement("div"); row.className="row";
-    row.innerHTML = `<span>${labels[k]||k}</span><input inputmode="numeric" value="${state.cc[k]??""}" data-k="${k}">`;
-    box.appendChild(row);
-  });
-  box.addEventListener("change", e=>{
-    const k = e.target.dataset.k; if(!k) return;
-    const v = e.target.value.trim();
-    if (v===""||isNaN(v)) state.cc[k]=""; else state.cc[k]=clamp(+v,0,127);
-    store.set(LS.cc, state.cc);
-  });
+  const box = $("#ccMap"); if (!box) return;
+  renderCCRows();
+  // Attach listeners once — buildCCMap() is called again on reset/import.
+  if (!box._wired){ box._wired = true; box.addEventListener("change", onCCChange); }
+  const s = $("#ccSearch");
+  if (s && !s._wired){ s._wired = true; s.addEventListener("input", renderCCRows); }
 }
 
 /* ---------------- export / import ---------------- */
@@ -1184,7 +1308,7 @@ function readFile(input){ return new Promise((res,rej)=>{ const f=input.files[0]
 function wire(){
   // nav
   $$("[data-view]").forEach(b=>b.addEventListener("click", ()=>switchView(b.dataset.view)));
-  $("#navToggle").onclick = ()=>$("#sidebar").classList.toggle("open");
+  $("#navToggle").onclick = ()=>{ const s=$("#sidebar"); s.classList.toggle("open"); $("#navToggle").setAttribute("aria-expanded", s.classList.contains("open")); };
 
   // connection
   $("#btnConnect").onclick = ()=>{ if(!access) initMIDI(); else bind(); toast("Rescanning MIDI…"); };
@@ -1229,6 +1353,9 @@ function wire(){
   // presets view
   $("#presetSearch").oninput = renderPresetGrid;
   $("#presetFilter").onchange = renderPresetGrid;
+  $("#presetSort").onchange = renderPresetGrid;
+  $("#chainExpand").onclick = ()=>$$("#chain .block").forEach(b=>b.classList.add("open"));
+  $("#chainCollapse").onclick = ()=>$$("#chain .block").forEach(b=>b.classList.remove("open"));
   $("#btnSeedFactory").onclick = ()=>seedFactoryNames();
   $("#btnExportPresets").onclick = ()=>download("code25-presets.json", state.presets);
   $("#btnImportPresets").onclick = ()=>$("#filePresets").click();
@@ -1257,6 +1384,15 @@ function wire(){
   $("#monClear").onclick = ()=>{ monBuf.length=0; monCount.in=monCount.out=monCount.sys=monCount.err=0; renderMonitor(); };
   $("#monPause").onclick = ()=>{ monPaused=!monPaused; if(!monPaused) renderMonitor(); else updateMonStats(); };
   $("#monFilter").oninput = ()=>renderMonitor();
+  const monDirEl = $("#monDir");
+  if (monDirEl) monDirEl.addEventListener("click", e=>{
+    const b=e.target.closest("button"); if(!b) return;
+    monDir = b.dataset.dir||"all";
+    monDirEl.querySelectorAll("button").forEach(x=>x.classList.toggle("on", x===b));
+    renderMonitor();
+  });
+  const monAutoEl = $("#monAuto");
+  if (monAutoEl) monAutoEl.onchange = ()=>{ monAuto = monAutoEl.checked; if (monAuto) renderMonitor(); };
 
   // settings data
   $("#btnResetCC").onclick = ()=>{ state.cc=Object.assign({},DEFAULT_CC); store.set(LS.cc,state.cc); buildCCMap(); toast("CC map reset"); };

@@ -74,8 +74,10 @@ one line: `python3 /path/to/gateway/app/desktop.py`.
 ### Amplifier view
 - **Panel tone** knobs — Gain, Bass, Middle, Treble, Volume — stored in the preset
   and streamed live as Control Change.
-- **Master** knob (amp-only global; not stored in presets) — sent as **CC 7**
-  (standard Master/Channel Volume; editable in Settings).
+- **Master** knob — shown for parity with the amp but **disabled**: the CODE's Master
+  is a physical analog output pot with no Control-Change or SysEx address (it is absent
+  from chart v2.1's CC list and from the 72-byte SysEx payload), so it cannot be set
+  over USB. It sends and receives nothing; loudness from the app is set with **Volume**.
 - **Full signal chain** as collapsible blocks, each with an on/off switch, a model
   select and its parameters:
   - **Pre FX** — Distortion, Auto Wah, Pitch Shifter, Compressor
@@ -120,12 +122,27 @@ one line: `python3 /path/to/gateway/app/desktop.py`.
   - **Toggle Marshall library** — add/remove it in your Marshall account library.
 
 ### Other
-- **Tuner** view (reads note data the amp emits in tuner mode).
+- **Tuner** view — large note readout with octave, a flat/sharp needle, a tuning
+  status pill and a rolling history of the notes it hears (the amp emits note data
+  while its tuner is engaged).
 - **MIDI Monitor** — every byte in and out, colour-coded, with a **Hex / Decoded**
-  toggle (CC messages resolve to their mapped control name), a live text filter,
-  **Pause/Resume** that keeps counting while frozen, byte counters, and Clear.
-- **Settings** — device/channel selection, editable full CC map, data export/import,
-  reset.
+  toggle (CC messages resolve to their mapped control name), a **direction filter**
+  (All / In / Out), a live text filter, an **Auto-scroll** toggle, **Pause/Resume**
+  that keeps counting while frozen, a colour legend, byte counters, and Clear.
+- **Amplifier** — tone/master knobs show a brass **level ring** for their position,
+  reset to centre on **double-click**, and are keyboard accessible (focus + arrows).
+  A **● unsaved** chip lights up when the editor differs from the stored slot, each
+  module header shows its **model position** (e.g. `Model 3 / 15`), and the signal
+  chain has **Expand all / Collapse all** buttons.
+- **Presets** — sort by slot, name or favourites-first; a live count strip
+  (shown / named / favourites / with effects); cards show effect chips and a
+  favourite star; click to load, double-click to rename.
+- **Settings** — device/channel selection, a grouped, searchable, editable CC map
+  (changed values are highlighted), data export/import, reset, and a
+  **Keyboard & gestures** reference card.
+- **Keyboard shortcuts** — `1`–`6` switch views, `←`/`→` step presets on the
+  Amplifier, `Esc` closes any dialog, scroll over a knob to fine-tune, double-click
+  a knob to reset.
 - Responsive layout with a mobile bottom nav.
 - Deep links: `#amp`, `#presets`, `#cloud`, `#tuner`, `#monitor`, `#settings`.
 
@@ -161,7 +178,9 @@ saved to your Marshall library. Your password is sent only to Marshall, never st
 Controls follow the official **CODE MIDI PC & CC Specification v2.1**. The CC map
 lives in `data.js` (`DEFAULT_CC`) and is editable in **Settings**. Gain (CC 70) and
 Treble (CC 73) are not printed on the chart; they are inferred from the sequential
-panel order and can be reassigned if your firmware differs.
+panel order and can be reassigned if your firmware differs. The chart has **no
+Master-volume control** — the amp's Master is a physical analog pot that is not
+MIDI-addressable, so the app leaves it out of the CC map and shows the knob disabled.
 
 Presets are transferred over SysEx. The published chart labels `0x72` as "current
 settings" and `0x73` as "preset", but shipping firmware is the other way round —
